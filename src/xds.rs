@@ -222,7 +222,7 @@ mod tests {
     use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 
     fn snapshot() -> Snapshot {
-        build([&service()], &[slice()], "::".parse().unwrap()).unwrap()
+        build([&service()], &[slice()]).unwrap()
     }
 
     fn request(type_url: &str) -> DiscoveryRequest {

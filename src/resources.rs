@@ -115,8 +115,8 @@ fn backend_addresses(
 pub fn build<'a>(
     services: impl IntoIterator<Item = &'a Service>,
     slices: &[EndpointSlice],
-    bind: IpAddr,
 ) -> anyhow::Result<Snapshot> {
+    let bind = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
     let mut snapshot = Snapshot::default();
     let mut bindings = BTreeMap::new();
     for service in services {
@@ -288,7 +288,7 @@ pub mod tests {
     }
 
     fn render(services: &[Service], slices: &[EndpointSlice]) -> Snapshot {
-        build(services, slices, "::".parse().unwrap()).unwrap()
+        build(services, slices).unwrap()
     }
 
     #[test]
@@ -425,13 +425,13 @@ pub mod tests {
         let mut second = service();
         second.metadata.name = Some("other".into());
         assert!(
-            build([&first, &second], &[], "::".parse().unwrap())
+            build([&first, &second], &[])
                 .unwrap_err()
                 .to_string()
                 .contains("conflict")
         );
         second.spec.as_mut().unwrap().ports.as_mut().unwrap()[0].protocol = Some("SCTP".into());
-        assert!(build([&second], &[], "::".parse().unwrap()).is_err());
+        assert!(build([&second], &[]).is_err());
     }
 
     #[test]
@@ -440,7 +440,7 @@ pub mod tests {
         service.spec.as_mut().unwrap().load_balancer_source_ranges =
             Some(vec!["192.0.2.0/24".into()]);
         assert!(
-            build([&service], &[], "::".parse().unwrap())
+            build([&service], &[])
                 .unwrap_err()
                 .to_string()
                 .contains("loadBalancerSourceRanges")

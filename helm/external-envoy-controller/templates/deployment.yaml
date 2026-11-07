@@ -24,14 +24,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: xds
-              containerPort: {{ .Values.xds.port }}
-          env:
-            - name: XDS_LISTEN_ADDRESS
-              value: {{ printf "0.0.0.0:%v" .Values.xds.port | quote }}
-            - name: ENVOY_LISTENER_ADDRESS
-              value: {{ .Values.envoyListenerAddress | quote }}
-            - name: RUST_LOG
-              value: {{ .Values.logLevel | quote }}
+              containerPort: 18000
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

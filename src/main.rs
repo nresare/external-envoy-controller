@@ -6,36 +6,30 @@ mod resources;
 mod services;
 mod xds;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use envoy_types::pb::envoy::service::discovery::v3::aggregated_discovery_service_server::AggregatedDiscoveryServiceServer;
 use kube::Client;
 use tokio::sync::watch;
 use tonic::transport::Server;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_max_level(tracing::Level::INFO)
         .init();
 
-    let listen: SocketAddr = std::env::var("XDS_LISTEN_ADDRESS")
-        .unwrap_or_else(|_| "127.0.0.1:18000".into())
-        .parse()?;
-    let bind: IpAddr = std::env::var("ENVOY_LISTENER_ADDRESS")
-        .unwrap_or_else(|_| "::".into())
-        .parse()?;
+    let listen = SocketAddr::from(([0, 0, 0, 0], 18000));
     let client = Client::try_default().await?;
     let (snapshots, receiver) = watch::channel(None);
     info!(
         load_balancer_class = services::LOAD_BALANCER_CLASS,
         "starting external-envoy-controller"
     );
-    info!(%listen, listener_address = %bind, "serving xDS ADS");
+    info!(%listen, "serving xDS ADS");
     tokio::select! {
-        result = controller::observe(client, snapshots, bind) => result?,
+        result = controller::observe(client, snapshots) => result?,
         result = Server::builder()
             .add_service(AggregatedDiscoveryServiceServer::new(xds::Ads { snapshots: receiver }))
             .serve(listen) => result?,

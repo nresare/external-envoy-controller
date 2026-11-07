@@ -11,7 +11,7 @@ spec:
     {{- include "external-envoy-controller.selectorLabels" . | nindent 4 }}
   ports:
     - name: xds
-      port: {{ .Values.xds.port }}
+      port: 18000
       targetPort: xds
       protocol: TCP
       appProtocol: kubernetes.io/h2c

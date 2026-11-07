@@ -5,13 +5,4 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
-# value for the RUST_LOG environment variable
-logLevel: info
-
-# Address the external Envoy binds for generated listeners (not the controller).
-envoyListenerAddress: "::"
-
-xds:
-  port: 18000
-
 resources: {}

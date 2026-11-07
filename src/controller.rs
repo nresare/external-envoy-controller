@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: The external-envoy-controller contributors
 
 use std::collections::BTreeMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -54,7 +53,6 @@ impl Slices {
 pub async fn observe(
     client: Client,
     snapshots: watch::Sender<Option<Arc<Snapshot>>>,
-    bind: IpAddr,
 ) -> anyhow::Result<()> {
     let services = watcher::watcher(
         Api::<Service>::all(client.clone()),
@@ -100,7 +98,7 @@ pub async fn observe(
         };
         if services_ready && slices_ready && (changed || snapshots.borrow().is_none()) {
             let slices = slice_state.current.values().cloned().collect::<Vec<_>>();
-            match resources::build(service_state.selected.values(), &slices, bind) {
+            match resources::build(service_state.selected.values(), &slices) {
                 Ok(snapshot) => {
                     let snapshot = Arc::new(snapshot);
                     snapshots.send_if_modified(|current| {
@@ -134,7 +132,7 @@ mod tests {
     async fn live_kubernetes_snapshot() {
         let client = Client::try_default().await.unwrap();
         let (sender, mut receiver) = watch::channel(None);
-        let observer = tokio::spawn(observe(client, sender, "::".parse().unwrap()));
+        let observer = tokio::spawn(observe(client, sender));
         let snapshot = tokio::time::timeout(
             std::time::Duration::from_secs(20),
             receiver.wait_for(Option::is_some),
