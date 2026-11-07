@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "external-envoy-controller.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "external-envoy-controller.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "external-envoy-controller.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: xds
+      port: {{ .Values.xds.port }}
+      targetPort: xds
+      protocol: TCP
+      appProtocol: kubernetes.io/h2c

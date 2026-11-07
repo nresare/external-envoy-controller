@@ -1,0 +1,17 @@
+image:
+  # Build and load this image locally, or set a published repository.
+  repository: external-envoy-controller
+  # defaults to the chart appVersion
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# value for the RUST_LOG environment variable
+logLevel: info
+
+# Address the external Envoy binds for generated listeners (not the controller).
+envoyListenerAddress: "::"
+
+xds:
+  port: 18000
+
+resources: {}

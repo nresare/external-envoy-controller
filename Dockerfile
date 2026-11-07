@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: The external-envoy-controller contributors
+
+# Adapted from https://github.com/LukeMathWalker/cargo-chef
+FROM rust:slim-trixie AS planner
+COPY --from=nresare/cargo-chef:binonly /cargo-chef /bin/cargo-chef
+WORKDIR /build
+
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM rust:slim-trixie AS builder
+WORKDIR /build
+COPY --from=planner /bin/cargo-chef /bin/cargo-chef
+COPY --from=planner /build/recipe.json recipe.json
+
+RUN cargo chef cook --release --recipe-path recipe.json
+
+COPY . .
+RUN cargo build --locked --release --package external-envoy-controller
+
+FROM gcr.io/distroless/cc-debian13:nonroot
+
+COPY --from=builder /build/target/release/external-envoy-controller /
+
+ENTRYPOINT ["/external-envoy-controller"]

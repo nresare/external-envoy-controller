@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "external-envoy-controller.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "external-envoy-controller.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "external-envoy-controller.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "external-envoy-controller.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "external-envoy-controller.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: external-envoy-controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: xds
+              containerPort: {{ .Values.xds.port }}
+          env:
+            - name: XDS_LISTEN_ADDRESS
+              value: {{ printf "0.0.0.0:%v" .Values.xds.port | quote }}
+            - name: ENVOY_LISTENER_ADDRESS
+              value: {{ .Values.envoyListenerAddress | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
