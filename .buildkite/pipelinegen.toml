@@ -1,1 +1,3 @@
 variant = "rust"
+output = "container"
+container-architecture = "arm64"
