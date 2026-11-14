@@ -1,0 +1,20 @@
+# Supplemental checks uploaded by bootstrap.sh alongside the generated Rust steps.
+steps:
+  - label: ":rust: Locked build"
+    key: build
+    agents:
+      speed: fast
+    timeout_in_minutes: 30
+    env:
+      RUSTFLAGS: -Dwarnings
+      CARGO_TERM_COLOR: always
+    command: cargo build --locked --verbose
+
+  - label: ":helm: Lint and render chart"
+    key: helm
+    agents:
+      speed: fast
+    timeout_in_minutes: 10
+    commands:
+      - docker run --rm --volume "$$PWD/helm:/charts:ro" alpine/helm:4.3.1 lint /charts/external-envoy-controller
+      - docker run --rm --volume "$$PWD/helm:/charts:ro" alpine/helm:4.3.1 template external-envoy-controller /charts/external-envoy-controller

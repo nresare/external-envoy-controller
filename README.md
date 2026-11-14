@@ -29,6 +29,16 @@ An optional read-only smoke test builds a snapshot from your current cluster:
 cargo test --locked live_kubernetes_snapshot -- --ignored --nocapture
 ```
 
+### Buildkite
+
+The Buildkite bootstrap command is `bash .buildkite/bootstrap.sh`. It uses
+`bktools` with `.buildkite/pipelinegen.toml` for formatting, Clippy, and tests,
+then uploads `.buildkite/pipeline.yml` for the locked build and Helm checks.
+Agents tagged `speed=fast` need Bash, Git, uv, Rust with rustfmt and Clippy,
+and Docker. Helm runs in a versioned container with the chart mounted read-only.
+The pipeline needs no Kubernetes credentials; the live cluster smoke test
+remains opt-in. Container publishing is not enabled.
+
 ## Container and Helm
 
 ```sh
