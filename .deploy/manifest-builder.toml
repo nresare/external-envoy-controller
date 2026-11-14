@@ -1,0 +1,3 @@
+[[simple]]
+namespace = "external-envoy-controller"
+replicas = 1

@@ -1,3 +1,4 @@
 variant = "rust"
 output = "container"
 container-architecture = "arm64"
+relcoord-endpoint = "https://relcoord.noa.re"
