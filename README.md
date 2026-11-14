@@ -29,6 +29,17 @@ An optional read-only smoke test builds a snapshot from your current cluster:
 cargo test --locked live_kubernetes_snapshot -- --ignored --nocapture
 ```
 
+### Buildkite
+
+Set up the pipeline in Buildkite with the following step to generate it from
+`.buildkite/pipelinegen.toml`:
+
+```yaml
+steps:
+  - label: ":pipeline: Generate pipeline"
+    command: uvx --from bktools --index https://repo.noa.re pipelinegen
+```
+
 ## Container and Helm
 
 ```sh
