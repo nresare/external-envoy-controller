@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: The external-envoy-controller contributors
 
 mod controller;
+mod reflection;
 mod resources;
 mod services;
 mod xds;
@@ -32,6 +33,8 @@ async fn main() -> anyhow::Result<()> {
         result = controller::observe(client, snapshots) => result?,
         result = Server::builder()
             .add_service(AggregatedDiscoveryServiceServer::new(xds::Ads { snapshots: receiver }))
+            .add_service(reflection::builder().build_v1()?)
+            .add_service(reflection::builder().build_v1alpha()?)
             .serve(listen) => result?,
         result = shutdown_signal() => result?,
     }

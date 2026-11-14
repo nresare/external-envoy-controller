@@ -83,6 +83,32 @@ Generated listeners cover only opted-in Services. Any other ports in an existing
 Puppet configuration need corresponding opted-in Services before replacing that
 configuration. Service load-balancer IPs do not select the listener bind address.
 
+### Inspecting xDS
+
+The xDS port also serves gRPC reflection (v1 and v1alpha), including descriptors
+for the published resources and their TCP/UDP filter configurations. With the
+port-forward running, use `grpcurl` without local protobuf files:
+
+```sh
+grpcurl -plaintext localhost:18000 list
+grpcurl -plaintext localhost:18000 describe \
+  envoy.service.discovery.v3.AggregatedDiscoveryService
+grpcurl -plaintext -d @ localhost:18000 \
+  envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources
+```
+
+The last command opens an interactive stream. Enter this JSON to subscribe to
+all clusters:
+
+```json
+{"node":{"id":"debug","cluster":"debug"},"typeUrl":"type.googleapis.com/envoy.config.cluster.v3.Cluster"}
+```
+
+Reflection supplies the schema; the client still manages xDS subscriptions and
+ACKs. EDS subscriptions must name the desired clusters. Listeners are withheld
+until the client accepts their CDS/EDS dependencies. Use Envoy's admin
+`/config_dump?include_eds` endpoint to inspect configuration accepted by Envoy.
+
 ## License
 
 MIT. The initial structure is adapted from `randomsecret`; its copyright notice
