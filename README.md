@@ -130,8 +130,15 @@ with the peer address and full RPC method path. This includes ADS, health, and
 both reflection versions. Health probes produce a call log each time they run.
 An ADS stream also logs its initial node identity, listen addresses, and first
 subscription to each resource type. Routine ACKs stay at debug level; NACKs
-remain warnings. Request headers and resource payloads are
-not logged.
+remain warnings. Each snapshot publication includes a JSON `changes` field
+listing added, updated, and removed listener, cluster, and endpoint resource
+names. Backend changes list added and removed IP:port pairs per endpoint
+resource, so pod replacement is visible even when resource counts stay the
+same. Service identity or port-set changes include the previous and new Service
+identities and listener names. The first snapshot is compared with an empty
+configuration; unchanged snapshots are not published or logged. These logs
+describe controller publication; they do not confirm that Envoy accepted it.
+Request headers and full resource payloads are not logged.
 
 ### Health checks
 
@@ -167,6 +174,32 @@ Reflection supplies the schema; the client still manages xDS subscriptions and
 ACKs. EDS subscriptions must name the desired clusters. Listeners are withheld
 until the client accepts their CDS/EDS dependencies. Use Envoy's admin
 `/config_dump?include_eds` endpoint to inspect configuration accepted by Envoy.
+
+The example bootstrap enables Envoy's admin interface on `127.0.0.1:9901`.
+For an existing Envoy, add the example's `admin` block to its bootstrap and
+restart it if the interface is not already enabled. Run these commands on the
+external Envoy host (or access the port through an SSH tunnel):
+
+```sh
+curl -fsS 'http://127.0.0.1:9901/config_dump?include_eds' | jq .
+curl -fsS 'http://127.0.0.1:9901/clusters?format=json' | jq .
+curl -fsS 'http://127.0.0.1:9901/listeners?format=json' | jq .
+```
+
+`config_dump` includes dynamic configuration versions and update timestamps;
+`include_eds` includes backend addresses. `/clusters` shows discovered hosts
+and their health. To compare configuration around a pod deletion, save dumps
+before and after the event:
+
+```sh
+curl -fsS 'http://127.0.0.1:9901/config_dump?include_eds' | jq -S . > before.json
+# After the backend change:
+curl -fsS 'http://127.0.0.1:9901/config_dump?include_eds' | jq -S . > after.json
+diff -u before.json after.json
+```
+
+Keep admin bound to localhost: it also exposes privileged operations.
+See the [Envoy admin API documentation](https://www.envoyproxy.io/docs/envoy/latest/operations/admin).
 
 ## License
 

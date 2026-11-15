@@ -7,6 +7,7 @@ mod logging;
 mod reflection;
 mod resources;
 mod services;
+mod snapshot_changes;
 mod status;
 mod xds;
 
