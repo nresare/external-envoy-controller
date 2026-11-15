@@ -81,7 +81,22 @@ CIDRs, permission to bind low ports, and available listener addresses/ports.
 
 Generated listeners cover only opted-in Services. Any other ports in an existing
 Puppet configuration need corresponding opted-in Services before replacing that
-configuration. Service load-balancer IPs do not select the listener bind address.
+configuration.
+
+Set `node.metadata.external_addresses` in the bootstrap to a non-empty list of
+the IPv4/IPv6 addresses configured on the external Envoy host. The example uses
+documentation addresses that must be replaced. The controller creates one
+listener per Service port and external IP, named
+`<namespace>/<service>/<protocol>/<port>/<ip>`. Cluster and endpoint resource
+names remain `<namespace>/<service>/<protocol>/<port>`.
+
+The address list is retained for the ADS stream, so subsequent requests can omit
+the node metadata. Each Envoy receives its own listener bindings; new Service
+ports use the same addresses automatically. Reconnect Envoy after changing its
+bootstrap addresses. Missing metadata on an LDS subscription, invalid IPs,
+wildcard/multicast addresses, and address changes within an existing stream are
+rejected. CDS/EDS inspection does not require address metadata. Service
+load-balancer status addresses do not select listener bindings.
 
 ### Inspecting xDS
 
