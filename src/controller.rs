@@ -108,6 +108,8 @@ pub async fn observe(
                         info!(
                             listeners = snapshot.listeners.len(),
                             clusters = snapshot.clusters.len(),
+                            endpoints = snapshot.endpoints.len(),
+                            changes = %crate::snapshot_changes::between(current.as_deref(), &snapshot),
                             "publishing xDS snapshot"
                         );
                         *current = Some(snapshot);
