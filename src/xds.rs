@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use envoy_types::pb::envoy::service::discovery::v3::{
     DeltaDiscoveryRequest, DeltaDiscoveryResponse, DiscoveryRequest, DiscoveryResponse,
     aggregated_discovery_service_server::AggregatedDiscoveryService,
 };
-use envoy_types::pb::google::protobuf::Any;
+use envoy_types::pb::google::protobuf::{Any, value::Kind};
 use futures::Stream;
 use tokio::sync::watch;
 use tonic::{Request, Response, Status, Streaming};
@@ -37,6 +38,7 @@ struct Subscription {
 struct Session {
     subscriptions: BTreeMap<String, Subscription>,
     nonce: u64,
+    external_addresses: Vec<IpAddr>,
 }
 
 impl Session {
@@ -48,6 +50,47 @@ impl Session {
         }
         if !request.resource_locators.is_empty() {
             return Err(Status::unimplemented("resource locators are not supported"));
+        }
+        if let Some(value) = request
+            .node
+            .as_ref()
+            .and_then(|node| node.metadata.as_ref())
+            .and_then(|metadata| metadata.fields.get("external_addresses"))
+        {
+            let invalid = || {
+                Status::invalid_argument(
+                    "node.metadata.external_addresses must be a non-empty list of concrete IP addresses",
+                )
+            };
+            let Some(Kind::ListValue(list)) = &value.kind else {
+                return Err(invalid());
+            };
+            let mut addresses = BTreeSet::new();
+            for value in &list.values {
+                let Some(Kind::StringValue(value)) = &value.kind else {
+                    return Err(invalid());
+                };
+                let address: IpAddr = value.parse().map_err(|_| invalid())?;
+                if address.is_unspecified() || address.is_multicast() {
+                    return Err(invalid());
+                }
+                addresses.insert(address);
+            }
+            if addresses.is_empty() {
+                return Err(invalid());
+            }
+            let addresses: Vec<_> = addresses.into_iter().collect();
+            if !self.external_addresses.is_empty() && self.external_addresses != addresses {
+                return Err(Status::invalid_argument(
+                    "external_addresses cannot change within an ADS stream; reconnect with the new node metadata",
+                ));
+            }
+            self.external_addresses = addresses;
+        }
+        if request.type_url == LDS && self.external_addresses.is_empty() {
+            return Err(Status::invalid_argument(
+                "LDS requires node.metadata.external_addresses; send it on the first request or the LDS request",
+            ));
         }
         let subscription = self
             .subscriptions
@@ -182,6 +225,8 @@ impl AggregatedDiscoveryService for Ads {
                 // Never send an empty startup snapshot before both Kubernetes watches synchronize.
                 let snapshot = snapshots.borrow_and_update().clone();
                 if let Some(snapshot) = snapshot {
+                    let snapshot = snapshot.for_addresses(&session.external_addresses)
+                        .map_err(|error| Status::internal(format!("cannot bind listeners: {error}")))?;
                     for response in session.responses(&snapshot) {
                         yield response;
                     }
@@ -228,7 +273,190 @@ mod tests {
     fn request(type_url: &str) -> DiscoveryRequest {
         DiscoveryRequest {
             type_url: type_url.into(),
+            node: Some(node(&["203.0.113.10", "2001:db8::10"])),
             ..Default::default()
+        }
+    }
+
+    fn node(addresses: &[&str]) -> envoy_types::pb::envoy::config::core::v3::Node {
+        use envoy_types::pb::google::protobuf::{ListValue, Struct, Value};
+        envoy_types::pb::envoy::config::core::v3::Node {
+            metadata: Some(Struct {
+                fields: [(
+                    "external_addresses".into(),
+                    Value {
+                        kind: Some(Kind::ListValue(ListValue {
+                            values: addresses
+                                .iter()
+                                .map(|address| Value {
+                                    kind: Some(Kind::StringValue((*address).into())),
+                                })
+                                .collect(),
+                        })),
+                    },
+                )]
+                .into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn listener_metadata_is_required_validated_and_retained_per_stream() {
+        use envoy_types::pb::google::protobuf::{Struct, Value};
+        for kind in [
+            None,
+            Some(Kind::StringValue("203.0.113.10".into())),
+            Some(Kind::NumberValue(10.0)),
+        ] {
+            let mut invalid_node = node(&["203.0.113.10"]);
+            invalid_node.metadata = Some(Struct {
+                fields: [("external_addresses".into(), Value { kind })].into(),
+            });
+            assert!(
+                Session::default()
+                    .request(DiscoveryRequest {
+                        node: Some(invalid_node),
+                        ..request(LDS)
+                    })
+                    .is_err()
+            );
+        }
+        for addresses in [
+            vec![],
+            vec!["bad"],
+            vec!["0.0.0.0"],
+            vec!["::"],
+            vec!["224.0.0.1"],
+            vec!["ff02::1"],
+        ] {
+            let mut session = Session::default();
+            let error = session
+                .request(DiscoveryRequest {
+                    node: Some(node(&addresses)),
+                    ..request(LDS)
+                })
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+        let mut session = Session::default();
+        session
+            .request(DiscoveryRequest {
+                node: None,
+                ..request(CDS)
+            })
+            .unwrap();
+        session
+            .request(DiscoveryRequest {
+                node: None,
+                ..request(EDS)
+            })
+            .unwrap();
+        assert!(
+            session
+                .request(DiscoveryRequest {
+                    node: None,
+                    ..request(LDS)
+                })
+                .is_err()
+        );
+        session.request(request(CDS)).unwrap();
+        session
+            .request(DiscoveryRequest {
+                node: None,
+                ..request(LDS)
+            })
+            .unwrap();
+        assert_eq!(session.external_addresses.len(), 2);
+        assert!(
+            session
+                .request(DiscoveryRequest {
+                    node: Some(node(&["203.0.113.11"])),
+                    ..request(LDS)
+                })
+                .is_err()
+        );
+        let mut other = Session::default();
+        other
+            .request(DiscoveryRequest {
+                node: Some(node(&["203.0.113.11", "203.0.113.11"])),
+                ..request(LDS)
+            })
+            .unwrap();
+        assert_eq!(
+            other.external_addresses,
+            ["203.0.113.11".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn listener_addresses_are_isolated_and_new_ports_use_the_same_addresses() {
+        use envoy_types::pb::envoy::config::{
+            core::v3::{
+                address::Address,
+                socket_address::{PortSpecifier, Protocol},
+            },
+            listener::v3::Listener,
+        };
+        use prost::Message;
+        let snapshot = snapshot();
+        let addresses = [
+            "203.0.113.10".parse().unwrap(),
+            "2001:db8::10".parse().unwrap(),
+        ];
+        let bound = snapshot.for_addresses(&addresses).unwrap();
+        assert_eq!(bound.clusters, snapshot.clusters);
+        assert_eq!(bound.endpoints, snapshot.endpoints);
+        assert_eq!(bound.listeners.len(), 4);
+        for (name, resource) in &bound.listeners {
+            let listener = Listener::decode(resource.value.as_slice()).unwrap();
+            assert_eq!(&listener.name, name);
+            let Some(Address::SocketAddress(socket)) = listener.address.unwrap().address else {
+                panic!("socket missing")
+            };
+            assert!(addresses.contains(&socket.address.parse::<IpAddr>().unwrap()));
+            assert_eq!(socket.port_specifier, Some(PortSpecifier::PortValue(443)));
+            assert_eq!(
+                socket.protocol,
+                if name.contains("/udp/") {
+                    Protocol::Udp as i32
+                } else {
+                    Protocol::Tcp as i32
+                }
+            );
+            assert!(!socket.ipv4_compat);
+        }
+        let other = snapshot
+            .for_addresses(&["203.0.113.11".parse().unwrap()])
+            .unwrap();
+        assert_ne!(
+            version(LDS, &bound.listeners),
+            version(LDS, &other.listeners)
+        );
+        assert!(
+            other
+                .listeners
+                .keys()
+                .all(|name| name.ends_with("/203.0.113.11"))
+        );
+        assert!(snapshot.for_addresses(&[]).unwrap().listeners.is_empty());
+
+        let mut service = service();
+        let ports = service.spec.as_mut().unwrap().ports.as_mut().unwrap();
+        let mut added = ports[0].clone();
+        added.port = 8443;
+        ports.push(added);
+        let updated = build([&service], &[slice()])
+            .unwrap()
+            .for_addresses(&addresses)
+            .unwrap();
+        assert_eq!(updated.listeners.len(), 6);
+        for ip in addresses {
+            assert!(
+                updated
+                    .listeners
+                    .contains_key(&format!("ingress/envoy/tcp/8443/{ip}"))
+            );
         }
     }
 
@@ -387,6 +615,56 @@ mod tests {
                 .await
                 .is_err()
         );
+        let names: Vec<_> = snapshot().endpoints.keys().cloned().collect();
+        requests
+            .send(DiscoveryRequest {
+                node: None,
+                resource_names: names.clone(),
+                ..request(EDS)
+            })
+            .await
+            .unwrap();
+        let eds = timeout(Duration::from_secs(2), responses.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        requests
+            .send(DiscoveryRequest {
+                node: None,
+                resource_names: names,
+                response_nonce: eds.nonce,
+                version_info: eds.version_info,
+                ..request(EDS)
+            })
+            .await
+            .unwrap();
+        requests
+            .send(DiscoveryRequest {
+                node: None,
+                ..request(LDS)
+            })
+            .await
+            .unwrap();
+        let lds = timeout(Duration::from_secs(2), responses.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(lds.type_url, LDS);
+        assert_eq!(lds.resources.len(), 4);
+        for resource in lds.resources {
+            use envoy_types::pb::envoy::config::{
+                core::v3::address::Address, listener::v3::Listener,
+            };
+            use prost::Message;
+            let listener = Listener::decode(resource.value.as_slice()).unwrap();
+            let Some(Address::SocketAddress(socket)) = listener.address.unwrap().address else {
+                panic!("socket missing")
+            };
+            assert!(["203.0.113.10", "2001:db8::10"].contains(&socket.address.as_str()));
+            assert!(!socket.ipv4_compat);
+        }
         sender.send(Some(Arc::new(Snapshot::default()))).unwrap();
         assert!(
             timeout(Duration::from_secs(2), responses.message())

@@ -35,6 +35,31 @@ pub struct Snapshot {
     pub listeners: BTreeMap<String, Any>,
 }
 
+impl Snapshot {
+    /// Instantiate listener templates for one Envoy's explicitly advertised IPs.
+    pub fn for_addresses(&self, addresses: &[IpAddr]) -> anyhow::Result<Self> {
+        let mut snapshot = self.clone();
+        snapshot.listeners.clear();
+        for resource in self.listeners.values() {
+            let template = listener::Listener::decode(resource.value.as_slice())?;
+            for ip in addresses {
+                let mut listener = template.clone();
+                listener.name = format!("{}/{}", template.name, ip);
+                let socket = match listener.address.as_mut().and_then(|a| a.address.as_mut()) {
+                    Some(core::address::Address::SocketAddress(socket)) => socket,
+                    _ => bail!("listener template has no socket address"),
+                };
+                socket.address = ip.to_string();
+                socket.ipv4_compat = false;
+                snapshot
+                    .listeners
+                    .insert(listener.name.clone(), pack(&listener));
+            }
+        }
+        Ok(snapshot)
+    }
+}
+
 pub fn pack<T: Message + Name>(message: &T) -> Any {
     Any {
         type_url: T::type_url(),
