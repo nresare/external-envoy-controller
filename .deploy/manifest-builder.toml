@@ -2,3 +2,4 @@
 namespace = "external-envoy-controller"
 replicas = 1
 grpc = true
+kube-vip-ip = "192.168.168.169"
