@@ -53,7 +53,7 @@ helm install external-envoy-controller helm/external-envoy-controller \
 Make the image available to your cluster first; override `image.repository` and
 `image.tag` for your registry. The chart grants cluster-wide `get`, `list`, and
 `watch` for Services and EndpointSlices and creates an internal ClusterIP xDS
-Service on port 18000.
+Service on port 50051.
 Release publishing is not configured.
 
 ## External Envoy
@@ -70,7 +70,7 @@ connection or tunnel. For development, run this on the external Envoy host:
 
 ```sh
 kubectl -n external-envoy-controller port-forward \
-  service/external-envoy-controller 18000:18000
+  service/external-envoy-controller 50051:50051
 envoy -c examples/envoy-bootstrap.yaml
 ```
 
@@ -98,6 +98,15 @@ wildcard/multicast addresses, and address changes within an existing stream are
 rejected. CDS/EDS inspection does not require address metadata. Service
 load-balancer status addresses do not select listener bindings.
 
+### Health checks
+
+The standard `grpc.health.v1.Health` service shares the cleartext gRPC port
+50051 with ADS and reflection. Kubernetes probes use health service names
+`liveness` and `readiness`. Liveness reports `SERVING` while the process responds;
+readiness reports `SERVING` once both Kubernetes watches have synchronized and
+a valid snapshot has been published, including an empty snapshot. The empty
+health service name reports overall readiness.
+
 ### Inspecting xDS
 
 The xDS port also serves gRPC reflection (v1 and v1alpha), including descriptors
@@ -105,10 +114,10 @@ for the published resources and their TCP/UDP filter configurations. With the
 port-forward running, use `grpcurl` without local protobuf files:
 
 ```sh
-grpcurl -plaintext localhost:18000 list
-grpcurl -plaintext localhost:18000 describe \
+grpcurl -plaintext localhost:50051 list
+grpcurl -plaintext localhost:50051 describe \
   envoy.service.discovery.v3.AggregatedDiscoveryService
-grpcurl -plaintext -d @ localhost:18000 \
+grpcurl -plaintext -d @ localhost:50051 \
   envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources
 ```
 

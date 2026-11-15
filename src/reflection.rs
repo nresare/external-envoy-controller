@@ -8,11 +8,13 @@ const ADS_SERVICE: &str = "envoy.service.discovery.v3.AggregatedDiscoveryService
 pub fn builder() -> Builder<'static> {
     Builder::configure()
         .register_encoded_file_descriptor_set(include_bytes!("../proto/xds-descriptors.bin"))
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .register_encoded_file_descriptor_set(tonic_reflection::pb::v1::FILE_DESCRIPTOR_SET)
         .register_encoded_file_descriptor_set(tonic_reflection::pb::v1alpha::FILE_DESCRIPTOR_SET)
         .include_reflection_service(false)
         // Imported files also describe services that this controller does not serve.
         .with_service_name(ADS_SERVICE)
+        .with_service_name("grpc.health.v1.Health")
         .with_service_name("grpc.reflection.v1.ServerReflection")
         .with_service_name("grpc.reflection.v1alpha.ServerReflection")
 }
@@ -46,8 +48,10 @@ mod tests {
                 let address = listener.local_addr().unwrap();
                 let (_snapshots, receiver) = watch::channel(None);
                 let (stop, stopped) = oneshot::channel();
+                let (_reporter, health_service) = crate::health::service().await;
                 let server = tokio::spawn(
                     Server::builder()
+                        .add_service(health_service)
                         .add_service(AggregatedDiscoveryServiceServer::new(xds::Ads {
                             snapshots: receiver,
                         }))
@@ -66,6 +70,7 @@ mod tests {
                 let mut client = ServerReflectionClient::new(channel);
                 let symbols = [
                     ADS_SERVICE,
+                    "grpc.health.v1.Health",
                     "envoy.config.cluster.v3.Cluster",
                     "envoy.config.endpoint.v3.ClusterLoadAssignment",
                     "envoy.config.listener.v3.Listener",
@@ -104,6 +109,7 @@ mod tests {
                     services,
                     [
                         ADS_SERVICE,
+                        "grpc.health.v1.Health",
                         "grpc.reflection.v1.ServerReflection",
                         "grpc.reflection.v1alpha.ServerReflection",
                     ]
