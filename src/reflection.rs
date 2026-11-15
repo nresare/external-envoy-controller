@@ -54,6 +54,7 @@ mod tests {
                         .add_service(health_service)
                         .add_service(AggregatedDiscoveryServiceServer::new(xds::Ads {
                             snapshots: receiver,
+                            advertisements: crate::status::Registry::default(),
                         }))
                         .add_service(builder().build_v1().unwrap())
                         .add_service(builder().build_v1alpha().unwrap())

@@ -14,7 +14,8 @@ proxy, but it might be useful in other similar situations.
 
 Install Rust supporting edition 2024, including rustfmt and Clippy.
 The controller uses the current kubeconfig context locally and ServiceAccount
-credentials inside Kubernetes. It only reads Kubernetes resources.
+credentials inside Kubernetes. It reads Services and EndpointSlices and patches
+load-balancer status on Services selected by its load-balancer class.
 
 ```sh
 cargo run --locked
@@ -52,8 +53,8 @@ helm install external-envoy-controller helm/external-envoy-controller \
 
 Make the image available to your cluster first; override `image.repository` and
 `image.tag` for your registry. The chart grants cluster-wide `get`, `list`, and
-`watch` for Services and EndpointSlices and creates an internal ClusterIP xDS
-Service on port 50051.
+`watch` for Services and EndpointSlices, and `patch` for `services/status`.
+It creates an internal ClusterIP xDS Service on port 50051.
 Release publishing is not configured.
 
 ## External Envoy
@@ -97,6 +98,28 @@ bootstrap addresses. Missing metadata on an LDS subscription, invalid IPs,
 wildcard/multicast addresses, and address changes within an existing stream are
 rejected. CDS/EDS inspection does not require address metadata. Service
 load-balancer status addresses do not select listener bindings.
+
+### Service load-balancer status
+
+For Services with `type: LoadBalancer` and
+`loadBalancerClass: noa.re/external-envoy`, the controller reconciles
+`status.loadBalancer.ingress` from the connected Envoys' `listen_addresses`.
+An address is published only after an LDS ACK covers every port of that Service
+on that address. Inspecting CDS/EDS alone does not advertise an address.
+
+Addresses are deduplicated across active ADS connections. A NACK retains the
+last accepted configuration; closing a connection withdraws its addresses unless
+another accepted connection still serves them. Service recreation or a changed
+port set requires matching accepted listeners before publication. Kubernetes
+write failures are logged and retried without interrupting xDS delivery. Updates
+touch only load-balancer ingress and preserve other status fields.
+
+Run one controller replica: connection state is held in this process, and
+cross-replica status coordination is not implemented. On restart, stale status
+is cleared until Envoys reconnect and acknowledge their configuration. The
+Envoy Gateway controller can consume the backing Service addresses to update
+Gateway status; this controller does not modify Gateway objects. An xDS ACK does
+not verify external network reachability.
 
 ### Health checks
 
