@@ -15,7 +15,7 @@ use envoy_types::pb::google::protobuf::{Any, value::Kind};
 use futures::Stream;
 use tokio::sync::watch;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::resources::{CDS, EDS, LDS, Snapshot};
 use crate::status::{Advertisement, Advertisements, Registry};
@@ -251,11 +251,16 @@ impl AggregatedDiscoveryService for Ads {
         &self,
         request: Request<Streaming<DiscoveryRequest>>,
     ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
+        let peer = request
+            .remote_addr()
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| "unknown".into());
         let mut requests = request.into_inner();
         let mut snapshots = self.snapshots.clone();
         let registration = self.advertisements.register();
         let output = async_stream::try_stream! {
             let mut session = Session::default();
+            let mut identified = false;
             loop {
                 let request = tokio::select! {
                     request = requests.message() => Some(request),
@@ -266,7 +271,17 @@ impl AggregatedDiscoveryService for Ads {
                 };
                 if let Some(request) = request {
                     let Some(request) = request? else { break };
+                    let new_subscription = !session.subscriptions.contains_key(&request.type_url);
+                    let type_url = request.type_url.clone();
+                    let node = request.node.as_ref().map(|node| (node.id.clone(), node.cluster.clone()));
                     session.request(request)?;
+                    if !identified && let Some((node_id, node_cluster)) = node {
+                        info!(%peer, %node_id, %node_cluster, listen_addresses = ?session.listen_addresses, "ADS client identified");
+                        identified = true;
+                    }
+                    if new_subscription {
+                        info!(%peer, %type_url, "ADS subscription opened");
+                    }
                     registration.publish(&session.accepted_advertisements);
                 }
                 // Never send an empty startup snapshot before both Kubernetes watches synchronize.

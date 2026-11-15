@@ -3,6 +3,7 @@
 
 mod controller;
 mod health;
+mod logging;
 mod reflection;
 mod resources;
 mod services;
@@ -31,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
     let advertisements = status::Registry::default();
     let status_client = client.clone();
     let status_advertisements = advertisements.clone();
+    let incoming = logging::incoming(tokio::net::TcpListener::bind(listen).await?);
     info!(
         load_balancer_class = services::LOAD_BALANCER_CLASS,
         "starting external-envoy-controller"
@@ -41,11 +43,12 @@ async fn main() -> anyhow::Result<()> {
         result = health::observe(health_reporter, health_snapshots) => result?,
         result = status::reconcile(status_client, status_advertisements) => result?,
         result = Server::builder()
+            .trace_fn(logging::request_span)
             .add_service(health_service)
             .add_service(AggregatedDiscoveryServiceServer::new(xds::Ads { snapshots: receiver, advertisements }))
             .add_service(reflection::builder().build_v1()?)
             .add_service(reflection::builder().build_v1alpha()?)
-            .serve(listen) => result?,
+            .serve_with_incoming(incoming) => result?,
         result = shutdown_signal() => result?,
     }
     info!("external-envoy-controller terminated");

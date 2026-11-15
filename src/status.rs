@@ -101,6 +101,7 @@ fn desired_ingress(service: &Service, connections: &Connections) -> Vec<LoadBala
         .into_iter()
         .map(|address| LoadBalancerIngress {
             ip: Some(address.to_string()),
+            ip_mode: Some("Proxy".into()),
             ..Default::default()
         })
         .collect()
@@ -118,16 +119,16 @@ fn status_patch(service: &Service, connections: &Connections) -> Option<Value> {
         .and_then(|lb| lb.ingress.as_ref())
         .cloned()
         .unwrap_or_default();
-    // Servers may default ipMode or reorder entries. Only reconcile addresses.
+    // Ignore ordering and unrelated ingress fields, but repair incorrect modes.
     if current.len() == desired.len()
         && current.iter().all(|entry| entry.hostname.is_none())
         && current
             .iter()
-            .map(|entry| &entry.ip)
+            .map(|entry| (&entry.ip, &entry.ip_mode))
             .collect::<BTreeSet<_>>()
             == desired
                 .iter()
-                .map(|entry| &entry.ip)
+                .map(|entry| (&entry.ip, &entry.ip_mode))
                 .collect::<BTreeSet<_>>()
     {
         return None;
@@ -281,7 +282,7 @@ mod tests {
             patch,
             json!({
                 "metadata":{"uid":"uid-1","resourceVersion":"42"},
-                "status":{"loadBalancer":{"ingress":[{"ip":"203.0.113.10"}]}},
+                "status":{"loadBalancer":{"ingress":[{"ip":"203.0.113.10","ipMode":"Proxy"}]}},
             })
         );
         service
@@ -304,7 +305,23 @@ mod tests {
             .as_mut()
             .unwrap()[0]
             .ip_mode = Some("VIP".into());
-        assert!(status_patch(&service, &connections).is_none());
+        let repaired = status_patch(&service, &connections).unwrap();
+        assert_eq!(
+            repaired["status"]["loadBalancer"]["ingress"][0]["ipMode"],
+            "Proxy"
+        );
+        service
+            .status
+            .as_mut()
+            .unwrap()
+            .load_balancer
+            .as_mut()
+            .unwrap()
+            .ingress
+            .as_mut()
+            .unwrap()[0]
+            .ip_mode = None;
+        assert!(status_patch(&service, &connections).is_some());
         let withdrawn = status_patch(&service, &BTreeMap::new()).unwrap();
         assert_eq!(withdrawn["status"]["loadBalancer"]["ingress"], json!([]));
     }
