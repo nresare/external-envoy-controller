@@ -104,6 +104,8 @@ load-balancer status addresses do not select listener bindings.
 For Services with `type: LoadBalancer` and
 `loadBalancerClass: noa.re/external-envoy`, the controller reconciles
 `status.loadBalancer.ingress` from the connected Envoys' `listen_addresses`.
+Each ingress entry uses `ipMode: Proxy`, because Envoy forwards to pod addresses
+and ports. Existing entries with a missing or different mode are corrected.
 An address is published only after an LDS ACK covers every port of that Service
 on that address. Inspecting CDS/EDS alone does not advertise an address.
 
@@ -120,6 +122,16 @@ is cleared until Envoys reconnect and acknowledge their configuration. The
 Envoy Gateway controller can consume the backing Service addresses to update
 Gateway status; this controller does not modify Gateway objects. An xDS ACK does
 not verify external network reachability.
+
+### Logging
+
+At info level, the controller logs accepted TCP connections and each gRPC call
+with the peer address and full RPC method path. This includes ADS, health, and
+both reflection versions. Health probes produce a call log each time they run.
+An ADS stream also logs its initial node identity, listen addresses, and first
+subscription to each resource type. Routine ACKs stay at debug level; NACKs
+remain warnings. Request headers and resource payloads are
+not logged.
 
 ### Health checks
 
