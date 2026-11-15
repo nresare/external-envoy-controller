@@ -6,6 +6,7 @@ mod health;
 mod reflection;
 mod resources;
 mod services;
+mod status;
 mod xds;
 
 use std::net::SocketAddr;
@@ -27,6 +28,9 @@ async fn main() -> anyhow::Result<()> {
     let (snapshots, receiver) = watch::channel(None);
     let (health_reporter, health_service) = health::service().await;
     let health_snapshots = receiver.clone();
+    let advertisements = status::Registry::default();
+    let status_client = client.clone();
+    let status_advertisements = advertisements.clone();
     info!(
         load_balancer_class = services::LOAD_BALANCER_CLASS,
         "starting external-envoy-controller"
@@ -35,9 +39,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = controller::observe(client, snapshots) => result?,
         result = health::observe(health_reporter, health_snapshots) => result?,
+        result = status::reconcile(status_client, status_advertisements) => result?,
         result = Server::builder()
             .add_service(health_service)
-            .add_service(AggregatedDiscoveryServiceServer::new(xds::Ads { snapshots: receiver }))
+            .add_service(AggregatedDiscoveryServiceServer::new(xds::Ads { snapshots: receiver, advertisements }))
             .add_service(reflection::builder().build_v1()?)
             .add_service(reflection::builder().build_v1alpha()?)
             .serve(listen) => result?,

@@ -28,11 +28,47 @@ pub const CDS: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 pub const EDS: &str = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
 pub const LDS: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceIdentity {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+}
+
+impl ServiceIdentity {
+    pub fn of(service: &Service) -> Self {
+        Self {
+            namespace: service.namespace().unwrap_or_default(),
+            name: service.name_any(),
+            uid: service.uid().unwrap_or_default(),
+        }
+    }
+}
+
+pub fn service_listener_names(service: &Service) -> BTreeSet<String> {
+    let identity = ServiceIdentity::of(service);
+    service
+        .spec
+        .iter()
+        .flat_map(|spec| spec.ports.iter().flatten())
+        .map(|port| {
+            format!(
+                "{}/{}/{}/{}",
+                identity.namespace,
+                identity.name,
+                port.protocol.as_deref().unwrap_or("TCP").to_lowercase(),
+                port.port
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
     pub clusters: BTreeMap<String, Any>,
     pub endpoints: BTreeMap<String, Any>,
     pub listeners: BTreeMap<String, Any>,
+    pub services: BTreeMap<ServiceIdentity, BTreeSet<String>>,
 }
 
 impl Snapshot {
@@ -273,6 +309,11 @@ pub fn build<'a>(
             }
             snapshot.clusters.insert(name.clone(), pack(&cluster));
             snapshot.endpoints.insert(name.clone(), pack(&assignment));
+            snapshot
+                .services
+                .entry(ServiceIdentity::of(service))
+                .or_default()
+                .insert(name.clone());
             snapshot.listeners.insert(name, pack(&listener));
         }
     }

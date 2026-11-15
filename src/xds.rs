@@ -18,12 +18,14 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
 
 use crate::resources::{CDS, EDS, LDS, Snapshot};
+use crate::status::{Advertisement, Advertisements, Registry};
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 #[derive(Clone)]
 pub struct Ads {
     pub snapshots: watch::Receiver<Option<Arc<Snapshot>>>,
+    pub advertisements: Registry,
 }
 
 #[derive(Default)]
@@ -39,6 +41,8 @@ struct Session {
     subscriptions: BTreeMap<String, Subscription>,
     nonce: u64,
     listen_addresses: Vec<IpAddr>,
+    sent_advertisements: Advertisements,
+    accepted_advertisements: Advertisements,
 }
 
 impl Session {
@@ -110,6 +114,9 @@ impl Session {
         } else if !request.response_nonce.is_empty() {
             if request.version_info == subscription.sent_version {
                 subscription.accepted_version = request.version_info.clone();
+                if request.type_url == LDS {
+                    self.accepted_advertisements = self.sent_advertisements.clone();
+                }
             }
             debug!(
                 type_url = request.type_url,
@@ -161,7 +168,13 @@ impl Session {
             let Some(subscription) = self.subscriptions.get_mut(type_url) else {
                 continue;
             };
-            let version = version(type_url, resources);
+            let mut version = version(type_url, resources);
+            if type_url == LDS {
+                // Recreated Services must be acknowledged again even if their ports are unchanged.
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                snapshot.services.hash(&mut hasher);
+                version.push_str(&format!("-{:016x}", hasher.finish()));
+            }
             if subscription.sent_version == version {
                 continue;
             }
@@ -173,6 +186,38 @@ impl Session {
                 })
                 .map(|(_, resource)| resource.clone())
                 .collect();
+            if type_url == LDS {
+                self.sent_advertisements = snapshot
+                    .services
+                    .iter()
+                    .filter_map(|(service, listeners)| {
+                        let addresses: BTreeSet<_> = self
+                            .listen_addresses
+                            .iter()
+                            .copied()
+                            .filter(|ip| {
+                                !listeners.is_empty()
+                                    && listeners.iter().all(|name| {
+                                        let name = format!("{name}/{ip}");
+                                        snapshot.listeners.contains_key(&name)
+                                            && (subscription.names.is_empty()
+                                                || subscription.names.contains(&name))
+                                    })
+                            })
+                            .collect();
+                        if addresses.is_empty() {
+                            return None;
+                        }
+                        Some((
+                            service.clone(),
+                            Advertisement {
+                                addresses,
+                                listeners: listeners.clone(),
+                            },
+                        ))
+                    })
+                    .collect();
+            }
             self.nonce += 1;
             subscription.nonce = self.nonce.to_string();
             subscription.sent_version = version.clone();
@@ -208,6 +253,7 @@ impl AggregatedDiscoveryService for Ads {
     ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
         let mut requests = request.into_inner();
         let mut snapshots = self.snapshots.clone();
+        let registration = self.advertisements.register();
         let output = async_stream::try_stream! {
             let mut session = Session::default();
             loop {
@@ -221,6 +267,7 @@ impl AggregatedDiscoveryService for Ads {
                 if let Some(request) = request {
                     let Some(request) = request? else { break };
                     session.request(request)?;
+                    registration.publish(&session.accepted_advertisements);
                 }
                 // Never send an empty startup snapshot before both Kubernetes watches synchronize.
                 let snapshot = snapshots.borrow_and_update().clone();
@@ -276,6 +323,164 @@ mod tests {
             node: Some(node(&["203.0.113.10", "2001:db8::10"])),
             ..Default::default()
         }
+    }
+
+    fn pending_listener_ack(snapshot: &Snapshot) -> (Session, DiscoveryResponse) {
+        let mut session = Session::default();
+        session.request(request(LDS)).unwrap();
+        session.request(request(CDS)).unwrap();
+        let cds = session.responses(snapshot).remove(0);
+        session
+            .request(DiscoveryRequest {
+                response_nonce: cds.nonce,
+                version_info: cds.version_info,
+                ..request(CDS)
+            })
+            .unwrap();
+        let names: Vec<_> = snapshot.endpoints.keys().cloned().collect();
+        session
+            .request(DiscoveryRequest {
+                resource_names: names.clone(),
+                ..request(EDS)
+            })
+            .unwrap();
+        let eds = session.responses(snapshot).remove(0);
+        session
+            .request(DiscoveryRequest {
+                response_nonce: eds.nonce,
+                version_info: eds.version_info,
+                resource_names: names,
+                ..request(EDS)
+            })
+            .unwrap();
+        let lds = session.responses(snapshot).remove(0);
+        (session, lds)
+    }
+
+    #[test]
+    fn status_requires_lds_ack_and_keeps_last_accepted_state_after_nack() {
+        let snapshot = snapshot()
+            .for_addresses(&[
+                "203.0.113.10".parse().unwrap(),
+                "2001:db8::10".parse().unwrap(),
+            ])
+            .unwrap();
+        let (mut session, lds) = pending_listener_ack(&snapshot);
+        assert!(session.accepted_advertisements.is_empty());
+        let ack = DiscoveryRequest {
+            response_nonce: lds.nonce,
+            version_info: lds.version_info,
+            ..request(LDS)
+        };
+        session
+            .request(DiscoveryRequest {
+                response_nonce: "stale".into(),
+                ..ack.clone()
+            })
+            .unwrap();
+        assert!(session.accepted_advertisements.is_empty());
+        session
+            .request(DiscoveryRequest {
+                error_detail: Some(rpc::Status::default()),
+                ..ack.clone()
+            })
+            .unwrap();
+        assert!(session.accepted_advertisements.is_empty());
+        session.request(ack).unwrap();
+        let accepted = session.accepted_advertisements.clone();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted.values().next().unwrap().addresses.len(), 2);
+
+        let mut recreated = snapshot.clone();
+        recreated.services = recreated
+            .services
+            .into_iter()
+            .map(|(mut identity, names)| {
+                identity.uid = "recreated-service".into();
+                (identity, names)
+            })
+            .collect();
+        let lds = session.responses(&recreated).remove(0);
+        session
+            .request(DiscoveryRequest {
+                response_nonce: lds.nonce.clone(),
+                version_info: String::new(),
+                error_detail: Some(rpc::Status::default()),
+                ..request(LDS)
+            })
+            .unwrap();
+        assert_eq!(session.accepted_advertisements, accepted);
+        session
+            .request(DiscoveryRequest {
+                response_nonce: lds.nonce,
+                version_info: lds.version_info,
+                ..request(LDS)
+            })
+            .unwrap();
+        assert!(
+            session
+                .accepted_advertisements
+                .keys()
+                .all(|identity| identity.uid == "recreated-service")
+        );
+    }
+
+    #[test]
+    fn partial_listener_subscriptions_publish_only_fully_covered_addresses() {
+        let snapshot = snapshot()
+            .for_addresses(&[
+                "203.0.113.10".parse().unwrap(),
+                "2001:db8::10".parse().unwrap(),
+            ])
+            .unwrap();
+        let (mut session, _) = pending_listener_ack(&snapshot);
+        let ipv4: Vec<_> = snapshot
+            .listeners
+            .keys()
+            .filter(|name| name.ends_with("/203.0.113.10"))
+            .cloned()
+            .collect();
+        session
+            .request(DiscoveryRequest {
+                resource_names: ipv4.clone(),
+                ..request(LDS)
+            })
+            .unwrap();
+        let lds = session.responses(&snapshot).remove(0);
+        session
+            .request(DiscoveryRequest {
+                response_nonce: lds.nonce,
+                version_info: lds.version_info,
+                resource_names: ipv4.clone(),
+                ..request(LDS)
+            })
+            .unwrap();
+        assert_eq!(
+            session
+                .accepted_advertisements
+                .values()
+                .next()
+                .unwrap()
+                .addresses,
+            ["203.0.113.10".parse().unwrap()].into()
+        );
+        let partial = vec![ipv4[0].clone()];
+        session
+            .request(DiscoveryRequest {
+                resource_names: partial.clone(),
+                ..request(LDS)
+            })
+            .unwrap();
+        let lds = session.responses(&snapshot).remove(0);
+        session
+            .request(DiscoveryRequest {
+                response_nonce: lds.nonce,
+                version_info: lds.version_info,
+                resource_names: partial,
+                ..request(LDS)
+            })
+            .unwrap();
+        assert!(session.accepted_advertisements.is_empty());
     }
 
     fn node(addresses: &[&str]) -> envoy_types::pb::envoy::config::core::v3::Node {
@@ -570,10 +775,13 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = watch::channel(None);
         let (stop, stopped) = oneshot::channel();
+        let advertisements = Registry::default();
+        let mut advertised = advertisements.subscribe();
         let server = tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(AggregatedDiscoveryServiceServer::new(Ads {
                     snapshots: receiver,
+                    advertisements,
                 }))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = stopped.await;
@@ -653,6 +861,33 @@ mod tests {
             .unwrap();
         assert_eq!(lds.type_url, LDS);
         assert_eq!(lds.resources.len(), 4);
+        assert!(advertised.borrow().is_empty());
+        requests
+            .send(DiscoveryRequest {
+                node: None,
+                response_nonce: lds.nonce.clone(),
+                version_info: lds.version_info.clone(),
+                ..request(LDS)
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), advertised.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            advertised
+                .borrow()
+                .values()
+                .next()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .addresses
+                .len(),
+            2
+        );
         for resource in lds.resources {
             use envoy_types::pb::envoy::config::{
                 core::v3::address::Address, listener::v3::Listener,
@@ -677,6 +912,13 @@ mod tests {
         );
         drop(responses);
         drop(requests);
+        timeout(
+            Duration::from_secs(2),
+            advertised.wait_for(BTreeMap::is_empty),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let (requests, incoming) = mpsc::channel(8);
         let mut responses = client
             .stream_aggregated_resources(ReceiverStream::new(incoming))

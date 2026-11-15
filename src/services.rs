@@ -23,7 +23,7 @@ pub enum Change {
     Removed(Service),
 }
 
-fn matches(service: &Service) -> bool {
+pub(crate) fn matches(service: &Service) -> bool {
     service.spec.as_ref().is_some_and(|spec| {
         spec.type_.as_deref() == Some("LoadBalancer")
             && spec.load_balancer_class.as_deref() == Some(LOAD_BALANCER_CLASS)
