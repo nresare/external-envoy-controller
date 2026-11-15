@@ -3,7 +3,7 @@
 `xds-descriptors.bin` contains the ADS, CDS, EDS, LDS, TCP proxy, and UDP proxy
 protobuf descriptors and their imports, extracted from `envoy-types` 0.7.7.
 They allow reflection clients to decode the nested `Any` messages published by
-the controller. Only ADS and the reflection services are advertised as callable
+the controller. Only ADS, health, and the reflection services are advertised as callable
 services.
 
 The descriptor set is checked in so normal builds do not require `protoc` or

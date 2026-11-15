@@ -24,7 +24,15 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: xds
-              containerPort: 18000
+              containerPort: 50051
+          livenessProbe:
+            grpc:
+              port: 50051
+              service: liveness
+          readinessProbe:
+            grpc:
+              port: 50051
+              service: readiness
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

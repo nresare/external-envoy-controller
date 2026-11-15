@@ -1,3 +1,4 @@
 [[simple]]
 namespace = "external-envoy-controller"
 replicas = 1
+grpc = true

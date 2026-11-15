@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: The external-envoy-controller contributors
 
 mod controller;
+mod health;
 mod reflection;
 mod resources;
 mod services;
@@ -21,9 +22,11 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    let listen = SocketAddr::from(([0, 0, 0, 0], 18000));
+    let listen = SocketAddr::from(([0, 0, 0, 0], 50051));
     let client = Client::try_default().await?;
     let (snapshots, receiver) = watch::channel(None);
+    let (health_reporter, health_service) = health::service().await;
+    let health_snapshots = receiver.clone();
     info!(
         load_balancer_class = services::LOAD_BALANCER_CLASS,
         "starting external-envoy-controller"
@@ -31,7 +34,9 @@ async fn main() -> anyhow::Result<()> {
     info!(%listen, "serving xDS ADS");
     tokio::select! {
         result = controller::observe(client, snapshots) => result?,
+        result = health::observe(health_reporter, health_snapshots) => result?,
         result = Server::builder()
+            .add_service(health_service)
             .add_service(AggregatedDiscoveryServiceServer::new(xds::Ads { snapshots: receiver }))
             .add_service(reflection::builder().build_v1()?)
             .add_service(reflection::builder().build_v1alpha()?)
