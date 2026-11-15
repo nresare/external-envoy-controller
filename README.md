@@ -83,10 +83,10 @@ Generated listeners cover only opted-in Services. Any other ports in an existing
 Puppet configuration need corresponding opted-in Services before replacing that
 configuration.
 
-Set `node.metadata.external_addresses` in the bootstrap to a non-empty list of
-the IPv4/IPv6 addresses configured on the external Envoy host. The example uses
+Set `node.metadata.listen_addresses` in the bootstrap to a non-empty list of
+the IPv4/IPv6 addresses configured on the Envoy host. The example uses
 documentation addresses that must be replaced. The controller creates one
-listener per Service port and external IP, named
+listener per Service port and listen IP, named
 `<namespace>/<service>/<protocol>/<port>/<ip>`. Cluster and endpoint resource
 names remain `<namespace>/<service>/<protocol>/<port>`.
 

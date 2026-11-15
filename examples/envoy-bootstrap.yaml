@@ -3,8 +3,8 @@ node:
   id: external-envoy
   cluster: external-envoy
   metadata:
-    # Replace with the addresses configured on this external Envoy host.
-    external_addresses:
+    # Replace with the addresses configured on this Envoy host.
+    listen_addresses:
       - "203.0.113.10"
       - "2001:db8::10"
 

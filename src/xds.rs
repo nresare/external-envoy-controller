@@ -38,7 +38,7 @@ struct Subscription {
 struct Session {
     subscriptions: BTreeMap<String, Subscription>,
     nonce: u64,
-    external_addresses: Vec<IpAddr>,
+    listen_addresses: Vec<IpAddr>,
 }
 
 impl Session {
@@ -55,11 +55,11 @@ impl Session {
             .node
             .as_ref()
             .and_then(|node| node.metadata.as_ref())
-            .and_then(|metadata| metadata.fields.get("external_addresses"))
+            .and_then(|metadata| metadata.fields.get("listen_addresses"))
         {
             let invalid = || {
                 Status::invalid_argument(
-                    "node.metadata.external_addresses must be a non-empty list of concrete IP addresses",
+                    "node.metadata.listen_addresses must be a non-empty list of concrete IP addresses",
                 )
             };
             let Some(Kind::ListValue(list)) = &value.kind else {
@@ -80,16 +80,16 @@ impl Session {
                 return Err(invalid());
             }
             let addresses: Vec<_> = addresses.into_iter().collect();
-            if !self.external_addresses.is_empty() && self.external_addresses != addresses {
+            if !self.listen_addresses.is_empty() && self.listen_addresses != addresses {
                 return Err(Status::invalid_argument(
-                    "external_addresses cannot change within an ADS stream; reconnect with the new node metadata",
+                    "listen_addresses cannot change within an ADS stream; reconnect with the new node metadata",
                 ));
             }
-            self.external_addresses = addresses;
+            self.listen_addresses = addresses;
         }
-        if request.type_url == LDS && self.external_addresses.is_empty() {
+        if request.type_url == LDS && self.listen_addresses.is_empty() {
             return Err(Status::invalid_argument(
-                "LDS requires node.metadata.external_addresses; send it on the first request or the LDS request",
+                "LDS requires node.metadata.listen_addresses; send it on the first request or the LDS request",
             ));
         }
         let subscription = self
@@ -225,7 +225,7 @@ impl AggregatedDiscoveryService for Ads {
                 // Never send an empty startup snapshot before both Kubernetes watches synchronize.
                 let snapshot = snapshots.borrow_and_update().clone();
                 if let Some(snapshot) = snapshot {
-                    let snapshot = snapshot.for_addresses(&session.external_addresses)
+                    let snapshot = snapshot.for_addresses(&session.listen_addresses)
                         .map_err(|error| Status::internal(format!("cannot bind listeners: {error}")))?;
                     for response in session.responses(&snapshot) {
                         yield response;
@@ -283,7 +283,7 @@ mod tests {
         envoy_types::pb::envoy::config::core::v3::Node {
             metadata: Some(Struct {
                 fields: [(
-                    "external_addresses".into(),
+                    "listen_addresses".into(),
                     Value {
                         kind: Some(Kind::ListValue(ListValue {
                             values: addresses
@@ -311,7 +311,7 @@ mod tests {
         ] {
             let mut invalid_node = node(&["203.0.113.10"]);
             invalid_node.metadata = Some(Struct {
-                fields: [("external_addresses".into(), Value { kind })].into(),
+                fields: [("listen_addresses".into(), Value { kind })].into(),
             });
             assert!(
                 Session::default()
@@ -367,7 +367,7 @@ mod tests {
                 ..request(LDS)
             })
             .unwrap();
-        assert_eq!(session.external_addresses.len(), 2);
+        assert_eq!(session.listen_addresses.len(), 2);
         assert!(
             session
                 .request(DiscoveryRequest {
@@ -384,7 +384,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            other.external_addresses,
+            other.listen_addresses,
             ["203.0.113.11".parse::<IpAddr>().unwrap()]
         );
     }

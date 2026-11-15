@@ -36,7 +36,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Instantiate listener templates for one Envoy's explicitly advertised IPs.
+    /// Instantiate listener templates for one Envoy's configured listen IPs.
     pub fn for_addresses(&self, addresses: &[IpAddr]) -> anyhow::Result<Self> {
         let mut snapshot = self.clone();
         snapshot.listeners.clear();
