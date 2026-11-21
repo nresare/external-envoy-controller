@@ -17,7 +17,6 @@ opentelemetry = { version = "0.33.1", default-features = false, features = ["tra
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "grpc-tonic", "tls-ring", "tls-roots", "internal-logs"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "internal-logs"] }
 prost = "0.14"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
 tonic = "0.14"
 tonic-reflection = { version = "0.14", features = ["server"] }
@@ -25,7 +24,6 @@ tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal",
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 tracing-opentelemetry = { version = "0.34.0", default-features = false }
-toml = "1.2"
 tonic-health = "0.14"
 
 [dev-dependencies]

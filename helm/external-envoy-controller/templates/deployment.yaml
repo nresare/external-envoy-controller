@@ -12,32 +12,18 @@ spec:
       {{- include "external-envoy-controller.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- if .Values.tracing.endpoint }}
-      annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-      {{- end }}
       labels:
         {{- include "external-envoy-controller.selectorLabels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "external-envoy-controller.fullname" . }}
       securityContext:
         runAsNonRoot: true
-      {{- if .Values.tracing.endpoint }}
-      volumes:
-        - name: config
-          configMap:
-            name: {{ include "external-envoy-controller.fullname" . }}-config
-      {{- end }}
       containers:
         - name: external-envoy-controller
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           {{- if .Values.tracing.endpoint }}
-          args: ["--config", "/etc/external-envoy-controller/controller.toml"]
-          volumeMounts:
-            - name: config
-              mountPath: /etc/external-envoy-controller
-              readOnly: true
+          args: ["--tracing-endpoint", {{ .Values.tracing.endpoint | quote }}]
           {{- end }}
           ports:
             - name: xds
