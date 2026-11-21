@@ -13,18 +13,14 @@ use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{filter::LevelFilter, prelude::*};
 
-use crate::config::Config;
+use crate::cli::Args;
 
 pub struct Telemetry {
     provider: Option<SdkTracerProvider>,
 }
 
-pub fn init(config: &Config) -> anyhow::Result<Telemetry> {
-    let provider = config
-        .tracing
-        .as_ref()
-        .map(|config| provider(&config.endpoint))
-        .transpose()?;
+pub fn init(args: &Args) -> anyhow::Result<Telemetry> {
+    let provider = args.tracing_endpoint.as_deref().map(provider).transpose()?;
     let otel = provider.as_ref().map(|provider| {
         tracing_opentelemetry::layer().with_tracer(provider.tracer("external-envoy-controller"))
     });

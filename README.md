@@ -149,34 +149,33 @@ Request headers and full resource payloads are not logged.
 
 ### OpenTelemetry tracing
 
-Tracing is optional; info-level stdout logging remains enabled. Start the
-controller with `--config PATH` to read a TOML file:
-
-```toml
-[tracing]
-endpoint = "http://otel-collector.observability.svc.cluster.local:4317"
-```
+Tracing is optional; info-level stdout logging remains enabled. Pass an OTLP
+gRPC collector endpoint on the command line:
 
 ```sh
-cargo run --locked -- --config examples/controller.toml
+cargo run --locked -- --tracing-endpoint http://tempo.tempo.svc:4317
 ```
 
-The endpoint must be an OTLP **gRPC** collector base URL (usually port 4317),
-with an `http://` or `https://` scheme and no signal path such as `/v1/traces`.
-HTTPS uses the system's trusted certificate authorities. Omitting the config
-file or the entire `[tracing]` block disables export. A present block requires
-`endpoint`; malformed config or unknown keys fail startup. Collector outages
-are handled asynchronously with a bounded batch queue; export failures are
-logged and do not block reconciliation. Pending completed spans are flushed on
-normal shutdown, including SIGTERM, with a bounded wait.
+The endpoint must be a collector base URL (usually port 4317), with an
+`http://` or `https://` scheme and no signal path such as `/v1/traces`. HTTPS
+uses the system's trusted certificate authorities. Omitting `--tracing-endpoint`
+disables export. Invalid endpoints or unknown arguments fail startup. Collector
+outages are handled asynchronously with a bounded batch queue; export failures
+are logged and do not block reconciliation. Pending completed spans are flushed
+on normal shutdown, including SIGTERM, with a bounded wait.
 
-For Helm, set `tracing.endpoint` to the collector URL. The chart creates and
-mounts the TOML config and restarts the pod when the config changes:
+The deployment's `[[simple]]` block supplies the endpoint through `args`:
+
+```toml
+args = ["--tracing-endpoint", "http://tempo.tempo.svc:4317"]
+```
+
+For Helm, set `tracing.endpoint`; the chart passes it as the container argument:
 
 ```sh
 helm upgrade --install external-envoy-controller helm/external-envoy-controller \
   --namespace external-envoy-controller --create-namespace \
-  --set tracing.endpoint=http://otel-collector.observability.svc.cluster.local:4317
+  --set tracing.endpoint=http://tempo.tempo.svc:4317
 ```
 
 Traces use `service.name=external-envoy-controller`. Short spans cover

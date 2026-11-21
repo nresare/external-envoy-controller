@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The external-envoy-controller contributors
 
-mod config;
+mod cli;
 mod controller;
 mod health;
 mod logging;
@@ -23,8 +23,8 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = config::Config::load(std::env::args_os().skip(1))?;
-    let telemetry = telemetry::init(&config)?;
+    let args = cli::Args::parse(std::env::args_os().skip(1))?;
+    let telemetry = telemetry::init(&args)?;
     let result = run().await;
     if let Err(error) = telemetry.shutdown().await {
         tracing::warn!(%error, "cannot flush traces on shutdown");
