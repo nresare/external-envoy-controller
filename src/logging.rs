@@ -40,7 +40,7 @@ mod tests {
         aggregated_discovery_service_server::AggregatedDiscoveryServiceServer,
     };
     use std::sync::{Arc, Mutex};
-    use tokio::sync::{oneshot, watch};
+    use tokio::sync::{mpsc, oneshot, watch};
     use tokio::time::{Duration, timeout};
     use tonic::transport::{Endpoint, Server};
     use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
@@ -72,6 +72,10 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .with_writer(move || writer.clone())
             .finish();
+        // Keep two dispatches registered so parallel tests cannot cache this
+        // subscriber's callsites as disabled on a thread without a subscriber.
+        // https://github.com/tokio-rs/tracing/issues/3611
+        let _dormant = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _guard = tracing::subscriber::set_default(subscriber);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -115,19 +119,51 @@ mod tests {
             .into_inner();
         assert!(reflection.message().await.unwrap().is_some());
         drop(reflection);
+        let (requests, incoming) = mpsc::channel(8);
         let mut ads = AggregatedDiscoveryServiceClient::new(channel)
-            .stream_aggregated_resources(tokio_stream::iter([DiscoveryRequest {
+            .stream_aggregated_resources(tokio_stream::wrappers::ReceiverStream::new(incoming))
+            .await
+            .unwrap()
+            .into_inner();
+        requests
+            .send(DiscoveryRequest {
                 type_url: crate::resources::CDS.into(),
                 node: Some(envoy_types::pb::envoy::config::core::v3::Node {
                     id: "logging-test".into(),
                     ..Default::default()
                 }),
                 ..Default::default()
-            }]))
+            })
             .await
-            .unwrap()
-            .into_inner();
+            .unwrap();
+        let response = ads.message().await.unwrap().unwrap();
+        requests
+            .send(DiscoveryRequest {
+                type_url: response.type_url,
+                response_nonce: response.nonce,
+                version_info: response.version_info,
+                resource_names: vec!["missing".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let response = ads.message().await.unwrap().unwrap();
+        requests
+            .send(DiscoveryRequest {
+                type_url: response.type_url,
+                response_nonce: response.nonce,
+                error_detail: Some(envoy_types::pb::google::rpc::Status {
+                    code: 3,
+                    message: "test rejection".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(ads.message().await.unwrap().is_some());
+        drop(requests);
+        assert!(ads.message().await.unwrap().is_none());
         drop(ads);
         stop.send(()).unwrap();
         timeout(Duration::from_secs(2), server)
@@ -137,6 +173,21 @@ mod tests {
             .unwrap();
         let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         assert!(logs.contains("gRPC client connected"), "{logs}");
+        for message in [
+            "ADS stream opened",
+            "ADS subscription updated",
+            "sending xDS response",
+            "Envoy accepted xDS configuration",
+            "Envoy rejected xDS configuration",
+            "ADS stream closed",
+            "logging-test",
+            "test rejection",
+            "nonce=",
+            "version=",
+        ] {
+            assert!(logs.contains(message), "missing {message}: {logs}");
+        }
+
         for path in [
             "/grpc.health.v1.Health/Check",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",

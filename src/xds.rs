@@ -38,6 +38,8 @@ struct Subscription {
 
 #[derive(Default)]
 struct Session {
+    peer: String,
+    node_id: String,
     subscriptions: BTreeMap<String, Subscription>,
     nonce: u64,
     listen_addresses: Vec<IpAddr>,
@@ -101,19 +103,27 @@ impl Session {
             .entry(request.type_url.clone())
             .or_default();
         if !request.response_nonce.is_empty() && request.response_nonce != subscription.nonce {
-            debug!(type_url = request.type_url, "ignoring stale xDS nonce");
+            warn!(peer = %self.peer, node_id = %self.node_id, type_url = request.type_url, nonce = request.response_nonce, expected_nonce = subscription.nonce, "ignoring stale xDS nonce");
             return Ok(());
         }
         if let Some(error) = request.error_detail {
             warn!(
+                peer = %self.peer,
+                node_id = %self.node_id,
                 type_url = request.type_url,
+                version = subscription.sent_version,
                 nonce = request.response_nonce,
+                code = error.code,
                 message = error.message,
                 "Envoy rejected xDS configuration"
             );
         } else if !request.response_nonce.is_empty() {
             if request.version_info == subscription.sent_version {
+                let newly_accepted = subscription.accepted_version != request.version_info;
                 subscription.accepted_version = request.version_info.clone();
+                if newly_accepted {
+                    info!(peer = %self.peer, node_id = %self.node_id, type_url = request.type_url, version = request.version_info, nonce = request.response_nonce, "Envoy accepted xDS configuration");
+                }
                 if request.type_url == LDS {
                     self.accepted_advertisements = self.sent_advertisements.clone();
                 }
@@ -125,6 +135,9 @@ impl Session {
             );
         }
         let names = request.resource_names.into_iter().collect();
+        if subscription.nonce.is_empty() || subscription.names != names {
+            info!(peer = %self.peer, node_id = %self.node_id, type_url = request.type_url, resource_names = ?names, "ADS subscription updated");
+        }
         if subscription.names != names {
             subscription.names = names;
             subscription.sent_version.clear();
@@ -221,6 +234,7 @@ impl Session {
             self.nonce += 1;
             subscription.nonce = self.nonce.to_string();
             subscription.sent_version = version.clone();
+            info!(peer = %self.peer, node_id = %self.node_id, %type_url, %version, nonce = subscription.nonce, resources = resources.len(), resource_names = ?subscription.names, "sending xDS response");
             responses.push(DiscoveryResponse {
                 version_info: version,
                 resources,
@@ -230,6 +244,15 @@ impl Session {
             });
         }
         responses
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let versions: BTreeMap<_, _> = self.subscriptions.iter().map(|(kind, subscription)| {
+            (kind, serde_json::json!({"sent": subscription.sent_version, "accepted": subscription.accepted_version}))
+        }).collect();
+        info!(peer = %self.peer, node_id = %self.node_id, versions = %serde_json::json!(versions), "ADS stream closed");
     }
 }
 
@@ -259,7 +282,12 @@ impl AggregatedDiscoveryService for Ads {
         let mut snapshots = self.snapshots.clone();
         let registration = self.advertisements.register();
         let output = async_stream::try_stream! {
-            let mut session = Session::default();
+            let mut session = Session {
+                peer: peer.clone(), node_id: String::new(), subscriptions: BTreeMap::new(),
+                nonce: 0, listen_addresses: Vec::new(),
+                sent_advertisements: Advertisements::new(), accepted_advertisements: Advertisements::new(),
+            };
+            info!(%peer, "ADS stream opened");
             let mut identified = false;
             loop {
                 let request = tokio::select! {
@@ -270,11 +298,20 @@ impl AggregatedDiscoveryService for Ads {
                     }
                 };
                 if let Some(request) = request {
-                    let Some(request) = request? else { break };
+                    let Some(request) = request.map_err(|error| {
+                        warn!(%peer, %error, "ADS receive failed");
+                        error
+                    })? else { break };
                     let new_subscription = !session.subscriptions.contains_key(&request.type_url);
                     let type_url = request.type_url.clone();
                     let node = request.node.as_ref().map(|node| (node.id.clone(), node.cluster.clone()));
-                    session.request(request)?;
+                    if let Some((node_id, _)) = &node {
+                        session.node_id = node_id.clone();
+                    }
+                    session.request(request).map_err(|error| {
+                        warn!(%peer, %error, "invalid ADS request; closing stream");
+                        error
+                    })?;
                     if !identified && let Some((node_id, node_cluster)) = node {
                         info!(%peer, %node_id, %node_cluster, listen_addresses = ?session.listen_addresses, "ADS client identified");
                         identified = true;
@@ -915,6 +952,83 @@ mod tests {
             assert!(["203.0.113.10", "2001:db8::10"].contains(&socket.address.as_str()));
             assert!(!socket.ipv4_compat);
         }
+        // A pod replacement changes EDS without changing CDS/LDS or resource counts.
+        let mut replacement = slice();
+        replacement.endpoints.as_mut().unwrap()[0].addresses = vec!["10.244.5.66".into()];
+        let latest = build([&service()], &[replacement]).unwrap();
+        sender.send(Some(Arc::new(latest.clone()))).unwrap();
+        let updated = timeout(Duration::from_secs(2), responses.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.type_url, EDS);
+        assert_eq!(updated.version_info, version(EDS, &latest.endpoints));
+        assert_eq!(
+            updated.resources,
+            latest.endpoints.values().cloned().collect::<Vec<_>>()
+        );
+        let changes = crate::snapshot_changes::between(Some(&snapshot()), &latest);
+        for name in latest.endpoints.keys() {
+            assert_eq!(
+                changes["backends"][name]["added"],
+                serde_json::json!(["10.244.5.66:10443"])
+            );
+            assert_eq!(
+                changes["backends"][name]["removed"],
+                serde_json::json!(["10.0.0.1:10443"])
+            );
+        }
+        requests
+            .send(DiscoveryRequest {
+                node: None,
+                resource_names: latest.endpoints.keys().cloned().collect(),
+                response_nonce: updated.nonce,
+                version_info: updated.version_info.clone(),
+                ..request(EDS)
+            })
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), responses.message())
+                .await
+                .is_err()
+        );
+
+        // Reconnecting must deliver the latest endpoints even if Envoy remembers a version.
+        drop(responses);
+        drop(requests);
+        timeout(
+            Duration::from_secs(2),
+            advertised.wait_for(BTreeMap::is_empty),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let (requests, incoming) = mpsc::channel(8);
+        let mut responses = client
+            .stream_aggregated_resources(ReceiverStream::new(incoming))
+            .await
+            .unwrap()
+            .into_inner();
+        requests
+            .send(DiscoveryRequest {
+                resource_names: latest.endpoints.keys().cloned().collect(),
+                version_info: updated.version_info,
+                ..request(EDS)
+            })
+            .await
+            .unwrap();
+        let reconnected = timeout(Duration::from_secs(2), responses.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconnected.type_url, EDS);
+        assert_eq!(
+            reconnected.resources,
+            latest.endpoints.values().cloned().collect::<Vec<_>>()
+        );
         sender.send(Some(Arc::new(Snapshot::default()))).unwrap();
         assert!(
             timeout(Duration::from_secs(2), responses.message())

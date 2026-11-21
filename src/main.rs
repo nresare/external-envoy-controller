@@ -44,6 +44,8 @@ async fn main() -> anyhow::Result<()> {
         result = health::observe(health_reporter, health_snapshots) => result?,
         result = status::reconcile(status_client, status_advertisements) => result?,
         result = Server::builder()
+            .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
+            .http2_keepalive_timeout(Some(std::time::Duration::from_secs(5)))
             .trace_fn(logging::request_span)
             .add_service(health_service)
             .add_service(AggregatedDiscoveryServiceServer::new(xds::Ads { snapshots: receiver, advertisements }))

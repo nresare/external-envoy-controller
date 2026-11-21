@@ -38,7 +38,11 @@ static_resources:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
           explicit_http_config:
-            http2_protocol_options: {}
+            http2_protocol_options:
+              # Detect a broken ADS transport even when no configuration changes.
+              connection_keepalive:
+                interval: 30s
+                timeout: 5s
       load_assignment:
         cluster_name: xds
         endpoints:
