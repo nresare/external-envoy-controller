@@ -27,7 +27,13 @@ pub fn request_span(request: &http::Request<()>) -> Span {
         .get::<TcpConnectInfo>()
         .and_then(|connection| connection.remote_addr)
         .map(|address| address.to_string());
-    let span = info_span!("grpc", peer = peer.as_deref().unwrap_or("unknown"), rpc = %request.uri().path());
+    let peer = peer.as_deref().unwrap_or("unknown");
+    let rpc = request.uri().path();
+    let span = if rpc == "/grpc.health.v1.Health/Check" {
+        info_span!("grpc.health_check", peer, rpc = %rpc)
+    } else {
+        info_span!("grpc", peer, rpc = %rpc)
+    };
     span.in_scope(|| info!("gRPC request"));
     span
 }
@@ -65,7 +71,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn logs_connections_and_calls_across_grpc_services() {
+    async fn logs_grpc_calls_but_exports_only_useful_traces() {
         let buffer = LogBuffer(Arc::new(Mutex::new(Vec::new())));
         let writer = buffer.clone();
         let collector = crate::telemetry::tests::Collector::start().await;
@@ -78,7 +84,13 @@ mod tests {
                     .without_time()
                     .with_writer(move || writer.clone()),
             )
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("logging-test")));
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(provider.tracer("logging-test"))
+                    .with_filter(tracing_subscriber::filter::filter_fn(
+                        crate::telemetry::export_enabled,
+                    )),
+            );
         // Keep two dispatches registered so parallel tests cannot cache this
         // subscriber's callsites as disabled on a thread without a subscriber.
         // https://github.com/tokio-rs/tracing/issues/3611
@@ -110,12 +122,14 @@ mod tests {
             .connect()
             .await
             .unwrap();
-        HealthClient::new(channel.clone())
-            .check(HealthCheckRequest {
-                service: "liveness".into(),
-            })
-            .await
-            .unwrap();
+        for service in ["liveness", "readiness", ""] {
+            HealthClient::new(channel.clone())
+                .check(HealthCheckRequest {
+                    service: service.into(),
+                })
+                .await
+                .unwrap();
+        }
         let mut reflection = ServerReflectionClient::new(channel.clone())
             .server_reflection_info(tokio_stream::iter([ServerReflectionRequest {
                 message_request: Some(MessageRequest::ListServices(String::new())),
@@ -195,13 +209,46 @@ mod tests {
             .flat_map(|scope| &scope.spans)
             .collect();
         for name in [
-            "grpc.connected",
             "xds.stream_opened",
             "xds.request",
             "xds.response",
             "xds.stream_closed",
         ] {
             assert!(spans.iter().any(|span| span.name == name), "missing {name}");
+        }
+        assert!(
+            spans
+                .iter()
+                .all(|span| !matches!(span.name.as_str(), "grpc.connected" | "grpc.health_check"))
+        );
+        assert!(
+            spans
+                .iter()
+                .flat_map(|span| &span.events)
+                .all(|event| event.name != "gRPC client connected")
+        );
+        assert!(
+            spans
+                .iter()
+                .flat_map(|span| &span.attributes)
+                .all(|attribute| attribute.key != "rpc"
+                    || attribute.value.as_ref().unwrap().value
+                        != Some(Value::StringValue("/grpc.health.v1.Health/Check".into())))
+        );
+        for rpc in [
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+            "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources",
+        ] {
+            assert!(
+                spans.iter().any(|span| span.name == "grpc"
+                    && span
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.key == "rpc"
+                            && attribute.value.as_ref().unwrap().value
+                                == Some(Value::StringValue(rpc.into())))),
+                "missing trace for {rpc}"
+            );
         }
         let response = spans
             .iter()
@@ -281,6 +328,11 @@ mod tests {
         }
         assert!(logs.contains("peer=127.0.0.1:"), "{logs}");
         assert!(!logs.contains("peer=unknown"), "{logs}");
-        assert_eq!(logs.matches("gRPC request").count(), 3, "{logs}");
+        assert_eq!(logs.matches("gRPC request").count(), 5, "{logs}");
+        assert_eq!(
+            logs.matches("rpc=/grpc.health.v1.Health/Check").count(),
+            3,
+            "{logs}"
+        );
     }
 }

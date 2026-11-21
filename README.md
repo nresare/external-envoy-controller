@@ -185,6 +185,11 @@ for a long-lived ADS stream to close. The log messages appear as span events
 with their fields as attributes: peer/node identity, resource type, version,
 nonce, counts, acceptance, and rejection details.
 
+Routine TCP connection spans (`grpc.connected`) and
+`/grpc.health.v1.Health/Check` request spans are excluded from trace export.
+They remain in stdout logs. ADS and reflection requests continue to produce
+traces, along with topology changes and xDS response/acceptance details.
+
 Nested topology and snapshot state is also available as searchable span
 attributes, rather than only JSON strings. For example,
 `changes.backends.envoy-gateway-system/envoy-eg-d8c59e83/tcp/443.added` is a native
