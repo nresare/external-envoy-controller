@@ -6,3 +6,7 @@ image:
   pullPolicy: IfNotPresent
 
 resources: {}
+
+# Set an OTLP gRPC collector URL to enable tracing (typically port 4317).
+tracing:
+  endpoint: ""

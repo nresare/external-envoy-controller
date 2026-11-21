@@ -15,7 +15,7 @@ use envoy_types::pb::google::protobuf::{Any, value::Kind};
 use futures::Stream;
 use tokio::sync::watch;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn};
 
 use crate::resources::{CDS, EDS, LDS, Snapshot};
 use crate::status::{Advertisement, Advertisements, Registry};
@@ -114,7 +114,7 @@ impl Session {
                 version = subscription.sent_version,
                 nonce = request.response_nonce,
                 code = error.code,
-                message = error.message,
+                error_message = error.message,
                 "Envoy rejected xDS configuration"
             );
         } else if !request.response_nonce.is_empty() {
@@ -234,7 +234,13 @@ impl Session {
             self.nonce += 1;
             subscription.nonce = self.nonce.to_string();
             subscription.sent_version = version.clone();
-            info!(peer = %self.peer, node_id = %self.node_id, %type_url, %version, nonce = subscription.nonce, resources = resources.len(), resource_names = ?subscription.names, "sending xDS response");
+            let span = info_span!("xds.response", peer = %self.peer, node_id = %self.node_id, %type_url, %version, nonce = subscription.nonce, resources = resources.len() as i64);
+            crate::telemetry::attributes(
+                &span,
+                "resource_names",
+                &serde_json::json!(subscription.names),
+            );
+            span.in_scope(|| info!(peer = %self.peer, node_id = %self.node_id, %type_url, %version, nonce = subscription.nonce, resources = resources.len() as i64, resource_names = ?subscription.names, "sending xDS response"));
             responses.push(DiscoveryResponse {
                 version_info: version,
                 resources,
@@ -252,7 +258,9 @@ impl Drop for Session {
         let versions: BTreeMap<_, _> = self.subscriptions.iter().map(|(kind, subscription)| {
             (kind, serde_json::json!({"sent": subscription.sent_version, "accepted": subscription.accepted_version}))
         }).collect();
-        info!(peer = %self.peer, node_id = %self.node_id, versions = %serde_json::json!(versions), "ADS stream closed");
+        let span = info_span!("xds.stream_closed", peer = %self.peer, node_id = %self.node_id);
+        crate::telemetry::attributes(&span, "versions", &serde_json::json!(versions));
+        span.in_scope(|| info!(peer = %self.peer, node_id = %self.node_id, versions = %serde_json::json!(versions), "ADS stream closed"));
     }
 }
 
@@ -287,7 +295,7 @@ impl AggregatedDiscoveryService for Ads {
                 nonce: 0, listen_addresses: Vec::new(),
                 sent_advertisements: Advertisements::new(), accepted_advertisements: Advertisements::new(),
             };
-            info!(%peer, "ADS stream opened");
+            info_span!("xds.stream_opened", %peer).in_scope(|| info!(%peer, "ADS stream opened"));
             let mut identified = false;
             loop {
                 let request = tokio::select! {
@@ -299,9 +307,14 @@ impl AggregatedDiscoveryService for Ads {
                 };
                 if let Some(request) = request {
                     let Some(request) = request.map_err(|error| {
-                        warn!(%peer, %error, "ADS receive failed");
+                        info_span!("xds.receive_error", %peer).in_scope(|| warn!(%peer, %error, "ADS receive failed"));
                         error
                     })? else { break };
+                    let span = info_span!("xds.request", %peer,
+                        node_id = request.node.as_ref().map(|node| node.id.as_str()).unwrap_or(&session.node_id),
+                        type_url = request.type_url, version = request.version_info, nonce = request.response_nonce);
+                    crate::telemetry::attributes(&span, "resource_names", &serde_json::json!(request.resource_names));
+                    let _entered = span.enter();
                     let new_subscription = !session.subscriptions.contains_key(&request.type_url);
                     let type_url = request.type_url.clone();
                     let node = request.node.as_ref().map(|node| (node.id.clone(), node.cluster.clone()));
@@ -314,6 +327,8 @@ impl AggregatedDiscoveryService for Ads {
                     })?;
                     if !identified && let Some((node_id, node_cluster)) = node {
                         info!(%peer, %node_id, %node_cluster, listen_addresses = ?session.listen_addresses, "ADS client identified");
+                        crate::telemetry::attributes(&span, "listen_addresses", &serde_json::json!(session.listen_addresses));
+                        span.record("node_id", &node_id);
                         identified = true;
                     }
                     if new_subscription {

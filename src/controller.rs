@@ -12,7 +12,7 @@ use kube::runtime::{
 };
 use kube::{Api, Client, ResourceExt};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{info, info_span, warn};
 
 use crate::resources::{self, Snapshot};
 use crate::services::{Change, Services};
@@ -27,14 +27,17 @@ impl Slices {
     fn log_event(&self, event: &Event<EndpointSlice>, services: &Services) {
         let slice = match event {
             Event::Init => {
-                info!("EndpointSlice watch synchronizing");
+                info_span!("kubernetes.endpointslice_sync")
+                    .in_scope(|| info!("EndpointSlice watch synchronizing"));
                 return;
             }
             Event::InitDone => {
-                info!(
-                    slices = self.initializing.len(),
-                    "EndpointSlice watch synchronized"
-                );
+                info_span!("kubernetes.endpointslice_sync").in_scope(|| {
+                    info!(
+                        slices = self.initializing.len() as i64,
+                        "EndpointSlice watch synchronized"
+                    )
+                });
                 return;
             }
             Event::Apply(slice) | Event::Delete(slice) => slice,
@@ -70,6 +73,17 @@ impl Slices {
                 })
             })
             .collect();
+        let span = info_span!(
+            "kubernetes.endpointslice_change",
+            namespace = key.0,
+            name = key.1,
+            service,
+            action = if deleted { "deleted" } else { "applied" },
+            resource_version = slice.resource_version()
+        );
+        crate::telemetry::attributes(&span, "endpoints", &serde_json::json!(endpoints));
+        crate::telemetry::attributes(&span, "ports", &serde_json::json!(slice.ports));
+        let _entered = span.enter();
         info!(
             namespace = key.0, name = key.1, service,
             action = if deleted { "deleted" } else { "applied" },
@@ -105,6 +119,30 @@ impl Slices {
     }
 }
 
+fn publish(current: &mut Option<Arc<Snapshot>>, snapshot: Arc<Snapshot>) -> bool {
+    if current.as_ref() == Some(&snapshot) {
+        return false;
+    }
+    let changes = crate::snapshot_changes::between(current.as_deref(), &snapshot);
+    let span = info_span!(
+        "xds.publish",
+        listeners = snapshot.listeners.len() as i64,
+        clusters = snapshot.clusters.len() as i64,
+        endpoints = snapshot.endpoints.len() as i64
+    );
+    crate::telemetry::attributes(&span, "changes", &changes);
+    let _entered = span.enter();
+    info!(
+        listeners = snapshot.listeners.len() as i64,
+        clusters = snapshot.clusters.len() as i64,
+        endpoints = snapshot.endpoints.len() as i64,
+        changes = %changes,
+        "publishing xDS snapshot"
+    );
+    *current = Some(snapshot);
+    true
+}
+
 pub async fn observe(
     client: Client,
     snapshots: watch::Sender<Option<Arc<Snapshot>>>,
@@ -129,21 +167,23 @@ pub async fn observe(
             event = services.next() => match event {
                 Some(Ok(event)) => {
                     match &event {
-                        Event::Init => info!("Service watch synchronizing"),
-                        Event::InitDone => { services_ready = true; info!("Service watch synchronized"); }
+                        Event::Init => info_span!("kubernetes.service_sync").in_scope(|| info!("Service watch synchronizing")),
+                        Event::InitDone => { services_ready = true; info_span!("kubernetes.service_sync").in_scope(|| info!("Service watch synchronized")); }
                         _ => {}
                     }
                     let changes = service_state.handle(event);
                     let changed = !changes.is_empty();
                     for change in changes {
-                        match change {
-                            Change::Observed(service) => info!(namespace = service.namespace(), name = service.name_any(), "observed matching Service"),
-                            Change::Removed(service) => info!(namespace = service.namespace(), name = service.name_any(), "Service no longer observed"),
-                        }
+                        let (service, action, message) = match change {
+                            Change::Observed(service) => (service, "observed", "observed matching Service"),
+                            Change::Removed(service) => (service, "removed", "Service no longer observed"),
+                        };
+                        info_span!("kubernetes.service_change", namespace = service.namespace(), name = service.name_any(), action)
+                            .in_scope(|| info!(namespace = service.namespace(), name = service.name_any(), "{message}"));
                     }
                     changed
                 }
-                Some(Err(error)) => { warn!(%error, "Service watch failed; retrying with backoff"); false }
+                Some(Err(error)) => { info_span!("kubernetes.service_watch_error").in_scope(|| warn!(%error, "Service watch failed; retrying with backoff")); false }
                 None => anyhow::bail!("Service watch ended unexpectedly"),
             },
             event = slices.next() => match event {
@@ -152,7 +192,7 @@ pub async fn observe(
                     slice_state.log_event(&event, &service_state);
                     slice_state.handle(event)
                 }
-                Some(Err(error)) => { warn!(%error, "EndpointSlice watch failed; retrying with backoff"); false }
+                Some(Err(error)) => { info_span!("kubernetes.endpointslice_watch_error").in_scope(|| warn!(%error, "EndpointSlice watch failed; retrying with backoff")); false }
                 None => anyhow::bail!("EndpointSlice watch ended unexpectedly"),
             }
         };
@@ -161,23 +201,10 @@ pub async fn observe(
             match resources::build(service_state.selected.values(), &slices) {
                 Ok(snapshot) => {
                     let snapshot = Arc::new(snapshot);
-                    snapshots.send_if_modified(|current| {
-                        if current.as_ref() == Some(&snapshot) {
-                            return false;
-                        }
-                        info!(
-                            listeners = snapshot.listeners.len(),
-                            clusters = snapshot.clusters.len(),
-                            endpoints = snapshot.endpoints.len(),
-                            changes = %crate::snapshot_changes::between(current.as_deref(), &snapshot),
-                            "publishing xDS snapshot"
-                        );
-                        *current = Some(snapshot);
-                        true
-                    });
+                    snapshots.send_if_modified(|current| publish(current, snapshot));
                 }
                 Err(error) => {
-                    warn!(%error, "cannot generate xDS snapshot; retaining last valid configuration")
+                    info_span!("xds.build_error").in_scope(|| warn!(%error, "cannot generate xDS snapshot; retaining last valid configuration"))
                 }
             }
         }
@@ -188,6 +215,83 @@ pub async fn observe(
 mod tests {
     use super::*;
     use crate::resources::tests::slice;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exports_structured_topology_and_backend_changes_over_otlp() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use tracing_subscriber::prelude::*;
+
+        let collector = crate::telemetry::tests::Collector::start().await;
+        let provider = collector.provider();
+        let _dormant = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("topology-test")));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let service = crate::resources::tests::service();
+        let mut services = Services::default();
+        services.handle(Event::Apply(service.clone()));
+        let mut slices = Slices::default();
+        slices.handle(Event::Apply(slice()));
+        let initial = resources::build([&service], &[slice()]).unwrap();
+        let mut replacement = slice();
+        replacement.endpoints.as_mut().unwrap()[0].addresses = vec!["10.244.5.66".into()];
+        slices.log_event(&Event::Apply(replacement.clone()), &services);
+        let latest = resources::build([&service], &[replacement]).unwrap();
+        let mut current = Some(Arc::new(initial));
+        assert!(publish(&mut current, Arc::new(latest)));
+        let resources = collector.finish(provider).await;
+        let spans: Vec<_> = resources
+            .iter()
+            .flat_map(|resource| &resource.scope_spans)
+            .flat_map(|scope| &scope.spans)
+            .collect();
+        let topology = spans
+            .iter()
+            .find(|span| span.name == "kubernetes.endpointslice_change")
+            .unwrap();
+        let ready = topology
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == "endpoints.0.conditions.ready")
+            .unwrap();
+        assert_eq!(
+            ready.value.as_ref().unwrap().value,
+            Some(Value::BoolValue(true))
+        );
+        let snapshot = spans
+            .iter()
+            .find(|span| span.name == "xds.publish")
+            .unwrap();
+        for protocol in ["tcp", "udp"] {
+            for (action, address) in [
+                ("added", "10.244.5.66:10443"),
+                ("removed", "10.0.0.1:10443"),
+            ] {
+                let key = format!("changes.backends.ingress/envoy/{protocol}/443.{action}");
+                let attribute = snapshot
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.key == key)
+                    .unwrap();
+                let Some(Value::ArrayValue(array)) = &attribute.value.as_ref().unwrap().value
+                else {
+                    panic!("backend changes must be native arrays")
+                };
+                assert_eq!(array.values.len(), 1);
+                assert_eq!(
+                    array.values[0].value,
+                    Some(Value::StringValue(address.into()))
+                );
+            }
+        }
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.name == "publishing xDS snapshot")
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires access to the current kubeconfig context; reads Services and EndpointSlices"]

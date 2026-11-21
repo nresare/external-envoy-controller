@@ -1,0 +1,2 @@
+[tracing]
+endpoint = "http://otel-collector.observability.svc.cluster.local:4317"
