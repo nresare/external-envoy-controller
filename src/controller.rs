@@ -24,6 +24,61 @@ struct Slices {
 }
 
 impl Slices {
+    fn log_event(&self, event: &Event<EndpointSlice>, services: &Services) {
+        let slice = match event {
+            Event::Init => {
+                info!("EndpointSlice watch synchronizing");
+                return;
+            }
+            Event::InitDone => {
+                info!(
+                    slices = self.initializing.len(),
+                    "EndpointSlice watch synchronized"
+                );
+                return;
+            }
+            Event::Apply(slice) | Event::Delete(slice) => slice,
+            Event::InitApply(_) => return,
+        };
+        let key = (slice.namespace().unwrap_or_default(), slice.name_any());
+        let service = slice.labels().get("kubernetes.io/service-name");
+        if !service.is_some_and(|name| {
+            services
+                .selected
+                .contains_key(&(key.0.clone(), name.clone()))
+        }) {
+            return;
+        }
+        let deleted = matches!(event, Event::Delete(_));
+        let previous = self.current.get(&key);
+        if !deleted
+            && previous.is_some_and(|old| {
+                old.endpoints == slice.endpoints
+                    && old.ports == slice.ports
+                    && old.address_type == slice.address_type
+            })
+        {
+            return;
+        }
+        let endpoints: Vec<_> = slice
+            .endpoints
+            .iter()
+            .flatten()
+            .map(|endpoint| {
+                serde_json::json!({
+                    "addresses": endpoint.addresses, "conditions": endpoint.conditions,
+                })
+            })
+            .collect();
+        info!(
+            namespace = key.0, name = key.1, service,
+            action = if deleted { "deleted" } else { "applied" },
+            resource_version = slice.resource_version(),
+            endpoints = %serde_json::json!(endpoints), ports = %serde_json::json!(slice.ports),
+            "observed EndpointSlice topology change"
+        );
+    }
+
     fn handle(&mut self, event: Event<EndpointSlice>) -> bool {
         let key = |slice: &EndpointSlice| (slice.namespace().unwrap_or_default(), slice.name_any());
         match event {
@@ -73,7 +128,11 @@ pub async fn observe(
         let changed = tokio::select! {
             event = services.next() => match event {
                 Some(Ok(event)) => {
-                    if matches!(event, Event::InitDone) { services_ready = true; }
+                    match &event {
+                        Event::Init => info!("Service watch synchronizing"),
+                        Event::InitDone => { services_ready = true; info!("Service watch synchronized"); }
+                        _ => {}
+                    }
                     let changes = service_state.handle(event);
                     let changed = !changes.is_empty();
                     for change in changes {
@@ -90,6 +149,7 @@ pub async fn observe(
             event = slices.next() => match event {
                 Some(Ok(event)) => {
                     if matches!(event, Event::InitDone) { slices_ready = true; }
+                    slice_state.log_event(&event, &service_state);
                     slice_state.handle(event)
                 }
                 Some(Err(error)) => { warn!(%error, "EndpointSlice watch failed; retrying with backoff"); false }
@@ -173,6 +233,29 @@ mod tests {
         assert!(state.handle(Event::InitDone));
         assert_eq!(state.current.len(), 1);
         assert!(!state.handle(Event::Apply(first.clone())));
+        let initial = resources::build(
+            [&crate::resources::tests::service()],
+            &state.current.values().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut replacement = first.clone();
+        replacement.endpoints.as_mut().unwrap()[0].addresses = vec!["10.244.5.66".into()];
+        assert!(state.handle(Event::Apply(replacement)));
+        let updated = resources::build(
+            [&crate::resources::tests::service()],
+            &state.current.values().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let changes = crate::snapshot_changes::between(Some(&initial), &updated);
+        for name in initial.endpoints.keys() {
+            assert_eq!(
+                changes["backends"][name],
+                serde_json::json!({
+                    "added": ["10.244.5.66:10443"], "removed": ["10.0.0.1:10443"]
+                })
+            );
+        }
+
         let mut changed = first.clone();
         changed.endpoints.as_mut().unwrap()[0]
             .conditions

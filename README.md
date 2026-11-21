@@ -129,8 +129,15 @@ At info level, the controller logs accepted TCP connections and each gRPC call
 with the peer address and full RPC method path. This includes ADS, health, and
 both reflection versions. Health probes produce a call log each time they run.
 An ADS stream also logs its initial node identity, listen addresses, and first
-subscription to each resource type. Routine ACKs stay at debug level; NACKs
-remain warnings. Each snapshot publication includes a JSON `changes` field
+subscription to each resource type, including requested resource names. Kubernetes
+watch synchronization and topology changes to EndpointSlices of selected Services
+are logged, including addresses, readiness/termination conditions, and ports.
+Each outgoing xDS response logs its peer, node ID, resource type, version, nonce,
+and resource count. The first ACK of a newly accepted version is logged at info
+level; duplicate ACKs stay at debug level. NACKs include the rejected version,
+nonce, and error at warning level. Stream closure is logged even on cancellation,
+with the last sent and accepted versions for each subscription.
+Each snapshot publication includes a JSON `changes` field
 listing added, updated, and removed listener, cluster, and endpoint resource
 names. Backend changes list added and removed IP:port pairs per endpoint
 resource, so pod replacement is visible even when resource counts stay the
@@ -197,6 +204,43 @@ curl -fsS 'http://127.0.0.1:9901/config_dump?include_eds' | jq -S . > before.jso
 curl -fsS 'http://127.0.0.1:9901/config_dump?include_eds' | jq -S . > after.json
 diff -u before.json after.json
 ```
+
+### Diagnosing stale endpoints and disconnected ADS
+
+Follow a pod replacement through the info logs: `observed EndpointSlice topology
+change`, `publishing xDS snapshot` with old/new backend IP:port pairs,
+`sending xDS response` for `ClusterLoadAssignment`, then `Envoy accepted xDS
+configuration` with the same version and nonce. A snapshot publication alone
+does not mean it was delivered or accepted. If publication appears without a
+response, check for a connected ADS stream and an EDS subscription naming the
+cluster. If the response has no ACK, look for a NACK or transport failure. An
+ACK followed by a stale dump warrants checking that the dump comes from the
+same Envoy node and that it has no other control-plane configuration.
+
+`HEALTHY` in a host listing or an endpoint's configured health status is not an
+ADS connection check. Without active health checks, hosts can remain healthy
+while unreachable. Envoy retains its last accepted configuration when the
+management server disconnects. Inspect the connection gauge and update counters
+on the Envoy host:
+
+```sh
+curl -fsSG 'http://127.0.0.1:9901/stats' \
+  --data-urlencode 'filter=control_plane.connected_state|update_success|update_failure|update_rejected|cx_connect_fail'
+```
+
+`control_plane.connected_state` is 1 for connected and 0 for disconnected. It
+reflects disconnections Envoy has detected; a broken transport can remain
+apparently connected until detected. The example bootstrap sends HTTP/2
+keepalive probes every 30 seconds with a 5 second timeout, and the controller
+also probes connections at those intervals. Apply the example's
+`connection_keepalive` block to the static xDS cluster in an existing bootstrap
+and restart Envoy to enable client-side detection. Server probes alone cannot
+enable detection on an Envoy whose controller is already gone. Keepalives detect
+transport failure; they do not verify endpoint freshness or make an intermediate
+proxy's upstream connection healthy.
+
+See Envoy's [management server documentation](https://www.envoyproxy.io/docs/envoy/latest/configuration/overview/mgmt_server)
+and [cluster health-check configuration](https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/cluster/v3/cluster.proto#envoy-v3-api-field-config-cluster-v3-cluster-health-checks).
 
 Keep admin bound to localhost: it also exposes privileged operations.
 See the [Envoy admin API documentation](https://www.envoyproxy.io/docs/envoy/latest/operations/admin).
