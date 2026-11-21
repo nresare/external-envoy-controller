@@ -9,9 +9,12 @@ use opentelemetry_otlp::{
     WithExportConfig, WithTonicConfig, tonic_types::transport::ClientTlsConfig,
 };
 use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
-use tracing::Span;
+use tracing::{Metadata, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::{filter::LevelFilter, prelude::*};
+use tracing_subscriber::{
+    filter::{LevelFilter, filter_fn},
+    prelude::*,
+};
 
 use crate::cli::Args;
 
@@ -22,7 +25,9 @@ pub struct Telemetry {
 pub fn init(args: &Args) -> anyhow::Result<Telemetry> {
     let provider = args.tracing_endpoint.as_deref().map(provider).transpose()?;
     let otel = provider.as_ref().map(|provider| {
-        tracing_opentelemetry::layer().with_tracer(provider.tracer("external-envoy-controller"))
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("external-envoy-controller"))
+            .with_filter(filter_fn(export_enabled))
     });
     tracing_subscriber::registry()
         .with(LevelFilter::INFO)
@@ -30,6 +35,13 @@ pub fn init(args: &Args) -> anyhow::Result<Telemetry> {
         .with(otel)
         .try_init()?;
     Ok(Telemetry { provider })
+}
+
+// This filter belongs only to the OpenTelemetry layer; stdout still records
+// connection and probe activity. Health checks have a distinct static span name
+// so filtering does not depend on inspecting the runtime RPC field.
+pub fn export_enabled(metadata: &Metadata<'_>) -> bool {
+    !matches!(metadata.name(), "grpc.connected" | "grpc.health_check")
 }
 
 fn provider(endpoint: &str) -> anyhow::Result<SdkTracerProvider> {
