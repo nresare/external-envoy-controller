@@ -147,6 +147,54 @@ configuration; unchanged snapshots are not published or logged. These logs
 describe controller publication; they do not confirm that Envoy accepted it.
 Request headers and full resource payloads are not logged.
 
+### OpenTelemetry tracing
+
+Tracing is optional; info-level stdout logging remains enabled. Start the
+controller with `--config PATH` to read a TOML file:
+
+```toml
+[tracing]
+endpoint = "http://otel-collector.observability.svc.cluster.local:4317"
+```
+
+```sh
+cargo run --locked -- --config examples/controller.toml
+```
+
+The endpoint must be an OTLP **gRPC** collector base URL (usually port 4317),
+with an `http://` or `https://` scheme and no signal path such as `/v1/traces`.
+HTTPS uses the system's trusted certificate authorities. Omitting the config
+file or the entire `[tracing]` block disables export. A present block requires
+`endpoint`; malformed config or unknown keys fail startup. Collector outages
+are handled asynchronously with a bounded batch queue; export failures are
+logged and do not block reconciliation. Pending completed spans are flushed on
+normal shutdown, including SIGTERM, with a bounded wait.
+
+For Helm, set `tracing.endpoint` to the collector URL. The chart creates and
+mounts the TOML config and restarts the pod when the config changes:
+
+```sh
+helm upgrade --install external-envoy-controller helm/external-envoy-controller \
+  --namespace external-envoy-controller --create-namespace \
+  --set tracing.endpoint=http://otel-collector.observability.svc.cluster.local:4317
+```
+
+Traces use `service.name=external-envoy-controller`. Short spans cover
+EndpointSlice topology changes, snapshot publication, each ADS request and
+response, and stream opening/closure. Updates are exported without waiting
+for a long-lived ADS stream to close. The log messages appear as span events
+with their fields as attributes: peer/node identity, resource type, version,
+nonce, counts, acceptance, and rejection details.
+
+Nested topology and snapshot state is also available as searchable span
+attributes, rather than only JSON strings. For example,
+`changes.backends.envoy-gateway-system/envoy-eg-d8c59e83/tcp/443.added` is a native
+string array of IP:port pairs, `endpoints.0.conditions.ready` is a boolean, and
+`resource_names` is a string array. Object fields use dotted keys; arrays of
+objects use numeric indexes. An ACK/NACK can be matched to a response by
+peer/node, resource type, version, and nonce. These spans describe controller
+actions and Envoy's responses; they do not assert backend network reachability.
+
 ### Health checks
 
 The standard `grpc.health.v1.Health` service shares the cleartext gRPC port

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The external-envoy-controller contributors
 
+mod config;
 mod controller;
 mod health;
 mod logging;
@@ -9,6 +10,7 @@ mod resources;
 mod services;
 mod snapshot_changes;
 mod status;
+mod telemetry;
 mod xds;
 
 use std::net::SocketAddr;
@@ -21,10 +23,16 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    let config = config::Config::load(std::env::args_os().skip(1))?;
+    let telemetry = telemetry::init(&config)?;
+    let result = run().await;
+    if let Err(error) = telemetry.shutdown().await {
+        tracing::warn!(%error, "cannot flush traces on shutdown");
+    }
+    result
+}
 
+async fn run() -> anyhow::Result<()> {
     let listen = SocketAddr::from(([0, 0, 0, 0], 50051));
     let client = Client::try_default().await?;
     let (snapshots, receiver) = watch::channel(None);

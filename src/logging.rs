@@ -17,7 +17,7 @@ pub fn incoming(listener: TcpListener) -> impl Stream<Item = io::Result<TcpStrea
                 .peer_addr()
                 .map(|address| address.to_string())
                 .unwrap_or_else(|_| "unknown".into());
-            info!(%peer, "gRPC client connected");
+            info_span!("grpc.connected", %peer).in_scope(|| info!(%peer, "gRPC client connected"));
         })
 }
 
@@ -39,6 +39,7 @@ mod tests {
         DiscoveryRequest, aggregated_discovery_service_client::AggregatedDiscoveryServiceClient,
         aggregated_discovery_service_server::AggregatedDiscoveryServiceServer,
     };
+    use opentelemetry::trace::TracerProvider;
     use std::sync::{Arc, Mutex};
     use tokio::sync::{mpsc, oneshot, watch};
     use tokio::time::{Duration, timeout};
@@ -48,6 +49,7 @@ mod tests {
         ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
         server_reflection_request::MessageRequest,
     };
+    use tracing_subscriber::prelude::*;
 
     #[derive(Clone)]
     struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -66,12 +68,17 @@ mod tests {
     async fn logs_connections_and_calls_across_grpc_services() {
         let buffer = LogBuffer(Arc::new(Mutex::new(Vec::new())));
         let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(move || writer.clone())
-            .finish();
+        let collector = crate::telemetry::tests::Collector::start().await;
+        let provider = collector.provider();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::INFO)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(move || writer.clone()),
+            )
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("logging-test")));
         // Keep two dispatches registered so parallel tests cannot cache this
         // subscriber's callsites as disabled on a thread without a subscriber.
         // https://github.com/tokio-rs/tracing/issues/3611
@@ -171,6 +178,83 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+        let resources = collector.finish(provider).await;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        let resource = resources[0].resource.as_ref().unwrap();
+        assert!(
+            resource
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "service.name"
+                    && attribute.value.as_ref().unwrap().value
+                        == Some(Value::StringValue("external-envoy-controller".into())))
+        );
+        let spans: Vec<_> = resources
+            .iter()
+            .flat_map(|resource| &resource.scope_spans)
+            .flat_map(|scope| &scope.spans)
+            .collect();
+        for name in [
+            "grpc.connected",
+            "xds.stream_opened",
+            "xds.request",
+            "xds.response",
+            "xds.stream_closed",
+        ] {
+            assert!(spans.iter().any(|span| span.name == name), "missing {name}");
+        }
+        let response = spans
+            .iter()
+            .find(|span| span.name == "xds.response")
+            .unwrap();
+        assert!(
+            response
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "resources"
+                    && attribute.value.as_ref().unwrap().value == Some(Value::IntValue(0)))
+        );
+        assert!(
+            response
+                .attributes
+                .iter()
+                .any(|attribute| attribute.key == "resource_names"
+                    && matches!(
+                        attribute.value.as_ref().unwrap().value,
+                        Some(Value::ArrayValue(_))
+                    ))
+        );
+        for event in [
+            "Envoy accepted xDS configuration",
+            "Envoy rejected xDS configuration",
+            "ADS stream closed",
+        ] {
+            assert!(
+                spans
+                    .iter()
+                    .flat_map(|span| &span.events)
+                    .any(|candidate| candidate.name == event),
+                "missing {event}"
+            );
+        }
+        let nack = spans
+            .iter()
+            .flat_map(|span| &span.events)
+            .find(|event| event.name == "Envoy rejected xDS configuration")
+            .unwrap();
+        assert!(
+            nack.attributes
+                .iter()
+                .any(|attribute| attribute.key == "error_message"
+                    && attribute.value.as_ref().unwrap().value
+                        == Some(Value::StringValue("test rejection".into())))
+        );
+        assert!(
+            nack.attributes
+                .iter()
+                .any(|attribute| attribute.key == "code"
+                    && attribute.value.as_ref().unwrap().value == Some(Value::IntValue(3)))
+        );
         let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         assert!(logs.contains("gRPC client connected"), "{logs}");
         for message in [
